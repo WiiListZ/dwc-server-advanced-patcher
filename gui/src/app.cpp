@@ -1,0 +1,1228 @@
+#include "app.hpp"
+
+#include "imgui.h"
+#include "misc/cpp/imgui_stdlib.h"
+
+#include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <sstream>
+
+namespace fs = std::filesystem;
+
+namespace
+{
+
+const ImVec4 colorOk{0.30f, 0.80f, 0.45f, 1.0f};
+const ImVec4 colorBad{0.95f, 0.38f, 0.38f, 1.0f};
+const ImVec4 colorWarn{0.98f, 0.72f, 0.25f, 1.0f};
+const ImVec4 colorMuted{0.60f, 0.63f, 0.68f, 1.0f};
+const ImVec4 colorAccent{0.0f, 0.63f, 0.90f, 1.0f};
+
+std::string trim(std::string text)
+{
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+        text.pop_back();
+    }
+    size_t start = 0;
+    while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start]))) {
+        ++start;
+    }
+    return text.substr(start);
+}
+
+std::string stripAnsi(const std::string& text)
+{
+    std::string out;
+    out.reserve(text.size());
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\x1b' && i + 1 < text.size() && text[i + 1] == '[') {
+            i += 2;
+            while (i < text.size() && !std::isalpha(static_cast<unsigned char>(text[i]))) {
+                ++i;
+            }
+            continue;
+        }
+        out += text[i];
+    }
+    return out;
+}
+
+void statusLine(bool ok, const char* label, const std::string& detail, const char* fix = nullptr)
+{
+    ImGui::TextColored(ok ? colorOk : colorBad, ok ? "  OK  " : "  --  ");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(label);
+    if (!detail.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(colorMuted, "%s", detail.c_str());
+    }
+    if (!ok && fix) {
+        ImGui::Indent(56);
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextColored(colorWarn, "%s", fix);
+        ImGui::PopTextWrapPos();
+        ImGui::Unindent(56);
+    }
+}
+
+bool primaryButton(const char* label, bool enabled = true)
+{
+    ImGui::BeginDisabled(!enabled);
+    ImGui::PushStyleColor(ImGuiCol_Button, colorAccent);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.10f, 0.70f, 0.95f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.0f, 0.52f, 0.78f, 1.0f));
+    bool clicked = ImGui::Button(label);
+    ImGui::PopStyleColor(3);
+    ImGui::EndDisabled();
+    return clicked;
+}
+
+const char* regionName(char region)
+{
+    switch (region) {
+    case 'E':
+        return "USA";
+    case 'P':
+        return "Europe";
+    case 'J':
+        return "Japan";
+    case 'K':
+        return "Korea";
+    case 'W':
+        return "Taiwan";
+    case 'C':
+        return "China";
+    default:
+        return "";
+    }
+}
+
+bool sameFileContent(const fs::path& a, const fs::path& b)
+{
+    auto first = readFile(a);
+    auto second = readFile(b);
+    return first && second && *first == *second;
+}
+
+} // namespace
+
+// ----- Settings -------------------------------------------------------------
+
+void Settings::load(const fs::path& file)
+{
+    auto content = readFile(file);
+    if (!content) {
+        return;
+    }
+    std::istringstream lines(*content);
+    std::string line;
+    while (std::getline(lines, line)) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        std::string key = trim(line.substr(0, eq));
+        std::string value = trim(line.substr(eq + 1));
+        auto flag = [&](bool& target) { target = value == "1"; };
+        if (key == "repo") repo = value;
+        else if (key == "shell") shell = value;
+        else if (key == "domain") domain = value;
+        else if (key == "serverDir") serverDir = value;
+        else if (key == "jobs") jobs = std::clamp(std::atoi(value.c_str()), 1, 64);
+        else if (key == "buildPayload") flag(buildPayload);
+        else if (key == "buildStage1") flag(buildStage1);
+        else if (key == "buildPatch") flag(buildPatch);
+        else if (key == "buildExploit") flag(buildExploit);
+        else if (key == "clean") flag(clean);
+        else if (key == "gameFilter") gameFilter = value;
+    }
+}
+
+void Settings::save(const fs::path& file) const
+{
+    std::ostringstream out;
+    out << "# dwc-server-advanced patcher GUI settings\n";
+    out << "repo=" << repo << "\n";
+    out << "shell=" << shell << "\n";
+    out << "domain=" << domain << "\n";
+    out << "serverDir=" << serverDir << "\n";
+    out << "jobs=" << jobs << "\n";
+    out << "buildPayload=" << buildPayload << "\n";
+    out << "buildStage1=" << buildStage1 << "\n";
+    out << "buildPatch=" << buildPatch << "\n";
+    out << "buildExploit=" << buildExploit << "\n";
+    out << "clean=" << clean << "\n";
+    out << "gameFilter=" << gameFilter << "\n";
+    writeFile(file, out.str());
+}
+
+// ----- App ------------------------------------------------------------------
+
+App::App()
+{
+    m_settingsFile = executableDir() / "patcher-gui.ini";
+    m_settings.load(m_settingsFile);
+    m_shells = availableShells();
+    if (!repoValid()) {
+        findRepo();
+    }
+    if (m_settings.shell.empty() && !m_shells.empty()) {
+        m_settings.shell = m_shells.front().label;
+    }
+    refreshGecko();
+    startCheck();
+}
+
+App::~App()
+{
+    if (m_task && m_task->running()) {
+        m_task->kill();
+    }
+    if (m_checkThread.joinable()) {
+        m_checkThread.join();
+    }
+    m_settings.save(m_settingsFile);
+}
+
+fs::path App::repoPath() const
+{
+    return pathFromUtf8(m_settings.repo);
+}
+
+bool App::repoValid() const
+{
+    if (m_settings.repo.empty()) {
+        return false;
+    }
+    fs::path repo = repoPath();
+    return fs::exists(repo / "make.sh") && fs::exists(repo / "gamedefs.csv");
+}
+
+// findRepo looks for the patcher folder around the program and the current
+// folder: the GUI is usually built inside the repository.
+void App::findRepo()
+{
+    for (fs::path start : {executableDir(), fs::current_path()}) {
+        for (fs::path dir = start; !dir.empty(); dir = dir.parent_path()) {
+            if (fs::exists(dir / "make.sh") && fs::exists(dir / "gamedefs.csv")) {
+                m_settings.repo = pathToUtf8(dir);
+                markDirty();
+                return;
+            }
+            if (dir == dir.parent_path()) {
+                break;
+            }
+        }
+    }
+}
+
+const Shell* App::currentShell() const
+{
+    for (const Shell& shell : m_shells) {
+        if (shell.label == m_settings.shell) {
+            return &shell;
+        }
+    }
+    return m_shells.empty() ? nullptr : &m_shells.front();
+}
+
+bool App::domainValid() const
+{
+    const std::string& domain = m_settings.domain;
+    if (domain.empty() || domain.size() > 200 || domain.front() == '.' || domain.back() == '.') {
+        return false;
+    }
+    return std::all_of(domain.begin(), domain.end(), [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-';
+    });
+}
+
+// scriptPrelude prepares the environment make.sh expects: devkitPPC and a
+// `python` command (Ubuntu only has python3).
+std::string App::scriptPrelude() const
+{
+    std::string prelude = "#!/bin/bash\n";
+    prelude += "if [ -z \"$DEVKITPRO\" ] && [ -d /opt/devkitpro ]; then export DEVKITPRO=/opt/devkitpro; fi\n";
+    prelude += "if [ -z \"$DEVKITPPC\" ] && [ -d \"$DEVKITPRO/devkitPPC\" ]; then export DEVKITPPC=\"$DEVKITPRO/devkitPPC\"; fi\n";
+    prelude += "if ! command -v python >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then\n";
+    prelude += "  shim=\"${TMPDIR:-/tmp}/dwc-patcher-gui\"; mkdir -p \"$shim\"\n";
+    prelude += "  ln -sf \"$(command -v python3)\" \"$shim/python\"; export PATH=\"$shim:$PATH\"\n";
+    prelude += "fi\n";
+    if (const Shell* shell = currentShell(); shell && repoValid()) {
+        prelude += "cd " + shellQuote(toShellPath(*shell, repoPath())) + " || exit 1\n";
+    }
+    return prelude;
+}
+
+void App::appendLog(const std::string& line)
+{
+    m_log.push_back(stripAnsi(line));
+    m_logScrollPending = true;
+    if (m_log.size() > 20000) {
+        m_log.erase(m_log.begin(), m_log.begin() + 5000);
+    }
+}
+
+bool App::makeScriptHasCRLF() const
+{
+    auto content = readFile(repoPath() / "make.sh");
+    return content && content->find("\r\n") != std::string::npos;
+}
+
+void App::fixMakeScript()
+{
+    fs::path file = repoPath() / "make.sh";
+    auto content = readFile(file);
+    if (!content) {
+        return;
+    }
+    std::string fixed;
+    fixed.reserve(content->size());
+    for (size_t i = 0; i < content->size(); ++i) {
+        if ((*content)[i] == '\r' && i + 1 < content->size() && (*content)[i + 1] == '\n') {
+            continue;
+        }
+        fixed += (*content)[i];
+    }
+    if (!writeFile(file, fixed)) {
+        appendLog("Cannot write " + pathToUtf8(file));
+    }
+}
+
+// ----- Environment check ------------------------------------------------------
+
+void App::startCheck()
+{
+    if (m_checking) {
+        return;
+    }
+    const Shell* shell = currentShell();
+    if (!shell) {
+        m_requirements = {};
+        m_requirements.checked = true;
+#ifdef _WIN32
+        m_requirements.shellError = "Neither WSL nor MSYS2 was found.";
+#else
+        m_requirements.shellError = "bash was not found.";
+#endif
+        return;
+    }
+
+    std::string script = scriptPrelude();
+    script += "echo \"shell=ok\"\n";
+    script += "gcc=\"$DEVKITPPC/bin/powerpc-eabi-gcc\"\n";
+    script += "if [ -x \"$gcc\" ]; then echo \"devkitppc=$DEVKITPPC\"; echo \"gcc=$(\"$gcc\" --version | head -1)\"; fi\n";
+    script += "echo \"python=$(python --version 2>&1 | head -1)\"\n";
+    script += "echo \"pythonok=$(python -c 'import sys; print(int(sys.version_info >= (3, 11)))' 2>/dev/null)\"\n";
+    script += "echo \"cryptography=$(python -c 'import cryptography; print(cryptography.__version__)' 2>/dev/null)\"\n";
+    script += "echo \"curl=$(command -v curl)\"\n";
+
+    fs::path scriptFile = (repoValid() ? repoPath() : executableDir()) / ".patcher-gui-check.sh";
+    if (!writeFile(scriptFile, script)) {
+        m_requirements = {};
+        m_requirements.checked = true;
+        m_requirements.shellError = "Cannot write " + pathToUtf8(scriptFile);
+        return;
+    }
+
+    m_checking = true;
+    m_checkDone = false;
+    std::vector<std::string> argv = shellArgv(*shell, scriptFile);
+    if (m_checkThread.joinable()) {
+        m_checkThread.join();
+    }
+    m_checkThread = std::thread([this, argv, scriptFile] {
+        CaptureResult result = runCapture(argv, scriptFile.parent_path());
+        std::error_code ignored;
+        fs::remove(scriptFile, ignored);
+        std::lock_guard lock(m_checkMutex);
+        m_checkResult = result;
+        m_checkDone = true;
+    });
+}
+
+void App::pollCheck()
+{
+    if (!m_checking) {
+        return;
+    }
+    CaptureResult result;
+    {
+        std::lock_guard lock(m_checkMutex);
+        if (!m_checkDone) {
+            return;
+        }
+        result = m_checkResult;
+    }
+    m_checking = false;
+
+    Requirements req;
+    req.checked = true;
+    std::map<std::string, std::string> values;
+    std::istringstream lines(result.output);
+    std::string line;
+    while (std::getline(lines, line)) {
+        line = trim(stripAnsi(line));
+        size_t eq = line.find('=');
+        if (eq != std::string::npos) {
+            values[line.substr(0, eq)] = trim(line.substr(eq + 1));
+        }
+    }
+    req.shellOk = values["shell"] == "ok";
+    if (!req.shellOk) {
+        req.shellError = !result.error.empty() ? result.error : trim(result.output);
+        if (req.shellError.empty()) {
+            req.shellError = "The shell did not run (exit code " + std::to_string(result.exitCode) + ").";
+        }
+    }
+    req.devkitPPC = values["devkitppc"];
+    req.gcc = values["gcc"];
+    req.python = values["python"];
+    req.pythonOk = values["pythonok"] == "1";
+    req.cryptography = values["cryptography"];
+    req.curl = values["curl"];
+    m_requirements = req;
+}
+
+// ----- Tasks ------------------------------------------------------------------
+
+bool App::startTask(TaskKind kind, const std::string& title, const std::string& command)
+{
+    if (m_task && m_task->running()) {
+        return false;
+    }
+    const Shell* shell = currentShell();
+    if (!shell || !repoValid()) {
+        appendLog("Cannot start: choose the patcher folder and a shell first.");
+        return false;
+    }
+
+    fs::path scriptFile = repoPath() / ".patcher-gui-run.sh";
+    std::string script = scriptPrelude() + "echo " + shellQuote("$ " + command) + "\n" + command + "\n";
+    if (!writeFile(scriptFile, script)) {
+        appendLog("Cannot write " + pathToUtf8(scriptFile));
+        return false;
+    }
+
+    m_log.clear();
+    m_logFollow = true;
+    m_task = std::make_unique<Process>();
+    if (!m_task->start(shellArgv(*shell, scriptFile), repoPath())) {
+        appendLog(m_task->error());
+        m_task.reset();
+        return false;
+    }
+    m_taskKind = kind;
+    m_taskTitle = title;
+    m_taskStart = std::chrono::steady_clock::now();
+    m_serverTest.clear();
+    return true;
+}
+
+void App::pollTask()
+{
+    if (!m_task) {
+        return;
+    }
+    for (const std::string& line : m_task->takeLines()) {
+        appendLog(line);
+    }
+    if (m_task->running()) {
+        m_taskSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_taskStart).count();
+        return;
+    }
+    m_task->wait();
+    for (const std::string& line : m_task->takeLines()) {
+        appendLog(line);
+    }
+    m_lastExitCode = m_task->exitCode();
+    m_lastTask = m_taskKind;
+    appendLog(m_lastExitCode == 0 ? "Finished." : "Failed with exit code " + std::to_string(m_lastExitCode) + ".");
+
+    if (m_taskKind == TaskKind::TestServer) {
+        std::string code;
+        for (auto it = m_log.rbegin(); it != m_log.rend(); ++it) {
+            if (it->rfind("HTTP ", 0) == 0) {
+                code = it->substr(5);
+                break;
+            }
+        }
+        if (code == "200") {
+            m_serverTest = "The server answers and serves stage 1 (HTTP 200).";
+        } else if (code == "000" || code.empty()) {
+            m_serverTest = "No answer from naswii." + m_settings.domain + ". Check the DNS records and that the server runs.";
+        } else {
+            m_serverTest = "The server answers with HTTP " + code + ": stage1.bin is probably not installed yet.";
+        }
+    }
+
+    std::error_code ignored;
+    fs::remove(repoPath() / ".patcher-gui-run.sh", ignored);
+    m_task.reset();
+    m_taskKind = TaskKind::None;
+    refreshGecko();
+}
+
+// ----- Status of the build ----------------------------------------------------
+
+App::KeyStatus App::keyStatus() const
+{
+    KeyStatus status;
+    if (!repoValid()) {
+        return status;
+    }
+    fs::path repo = repoPath();
+    status.privateKey = fs::exists(repo / "misc" / "private-key-OUT.pem");
+    status.distKey = fs::exists(repo / "dist" / "private-key.pem");
+    status.distMatches = status.privateKey && status.distKey &&
+                         sameFileContent(repo / "misc" / "private-key-OUT.pem", repo / "dist" / "private-key.pem");
+    fs::path generated = repo / "misc" / "wwfcPayloadPublicKey-OUT.hpp";
+    std::error_code error;
+    if (fs::exists(generated) && fs::file_size(generated, error) > 0) {
+        status.publicKeyMatches = sameFileContent(generated, repo / "include" / "wwfcPayloadPublicKey.hpp");
+    }
+    return status;
+}
+
+App::BuildOutput App::buildOutput() const
+{
+    BuildOutput output;
+    if (!repoValid()) {
+        return output;
+    }
+    fs::path repo = repoPath();
+    std::error_code error;
+    for (const auto& entry : fs::directory_iterator(repo / "dist" / "binary", error)) {
+        if (entry.path().extension() == ".bin") {
+            ++output.payloads;
+        }
+    }
+    output.stage1 = fs::exists(repo / "dist" / "stage1.bin");
+    output.key = fs::exists(repo / "dist" / "private-key.pem");
+    for (const auto& entry : fs::directory_iterator(repo / "exploit" / "sbcm", error)) {
+        if (entry.path().extension() == ".bin") {
+            ++output.sbcm;
+        }
+    }
+    output.gecko = static_cast<int>(m_geckoFiles.size());
+    return output;
+}
+
+void App::refreshGecko()
+{
+    m_geckoFiles.clear();
+    if (!repoValid()) {
+        return;
+    }
+    std::error_code error;
+    for (const auto& entry : fs::directory_iterator(repoPath() / "patch" / "build", error)) {
+        if (entry.path().extension() == ".txt") {
+            m_geckoFiles.push_back(pathToUtf8(entry.path().stem()));
+        }
+    }
+    std::sort(m_geckoFiles.begin(), m_geckoFiles.end());
+}
+
+// install copies the build into the server's payload folder, as described in
+// the README: dist/ → payload/, exploit/sbcm/*.bin → payload/sbcm/.
+bool App::install(std::string& message)
+{
+    if (!repoValid()) {
+        message = "Choose the patcher folder first.";
+        return false;
+    }
+    fs::path server = pathFromUtf8(m_settings.serverDir);
+    if (m_settings.serverDir.empty() || !fs::is_directory(server)) {
+        message = "Choose the server folder (the one with config.yml).";
+        return false;
+    }
+    fs::path repo = repoPath();
+    fs::path dist = repo / "dist";
+    if (!fs::exists(dist / "stage1.bin") || !fs::exists(dist / "private-key.pem")) {
+        message = "dist/ is incomplete: build stage 1 and the payloads first.";
+        return false;
+    }
+
+    fs::path payload = server / "payload";
+    std::error_code error;
+    fs::create_directories(payload / "sbcm", error);
+    if (error) {
+        message = "Cannot create " + pathToUtf8(payload) + ": " + error.message();
+        return false;
+    }
+
+    int copied = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(dist, error)) {
+        fs::path target = payload / fs::relative(entry.path(), dist);
+        if (entry.is_directory()) {
+            fs::create_directories(target, error);
+            continue;
+        }
+        fs::copy_file(entry.path(), target, fs::copy_options::overwrite_existing, error);
+        if (error) {
+            message = "Cannot copy " + pathToUtf8(entry.path()) + ": " + error.message();
+            return false;
+        }
+        ++copied;
+    }
+    int exploits = 0;
+    for (const auto& entry : fs::directory_iterator(repo / "exploit" / "sbcm", error)) {
+        if (entry.path().extension() != ".bin") {
+            continue;
+        }
+        fs::copy_file(entry.path(), payload / "sbcm" / entry.path().filename(), fs::copy_options::overwrite_existing, error);
+        if (error) {
+            message = "Cannot copy " + pathToUtf8(entry.path()) + ": " + error.message();
+            return false;
+        }
+        ++exploits;
+    }
+    message = "Installed " + std::to_string(copied) + " files and " + std::to_string(exploits) + " SBCM exploits into " +
+              pathToUtf8(payload) + ". The server reads them on every request, so no restart is needed.";
+    return true;
+}
+
+// ----- Drawing ----------------------------------------------------------------
+
+void App::showPage(const std::string& name)
+{
+    if (name == "requirements") m_page = Page::Requirements;
+    else if (name == "server") m_page = Page::Server;
+    else if (name == "keys") m_page = Page::Keys;
+    else if (name == "build") m_page = Page::Build;
+    else if (name == "install") m_page = Page::Install;
+    else if (name == "gecko") {
+        m_page = Page::Gecko;
+        refreshGecko();
+        if (!m_geckoFiles.empty()) {
+            auto it = std::find(m_geckoFiles.begin(), m_geckoFiles.end(), "RMCPD00");
+            m_geckoSelected = it != m_geckoFiles.end() ? *it : m_geckoFiles.front();
+            m_geckoContent = readFile(repoPath() / "patch" / "build" / pathFromUtf8(m_geckoSelected + ".txt")).value_or("");
+        }
+    }
+}
+
+void App::heading(const char* title, const char* description)
+{
+    if (m_boldFont) {
+        ImGui::PushFont(m_boldFont);
+    }
+    ImGui::TextUnformatted(title);
+    if (m_boldFont) {
+        ImGui::PopFont();
+    }
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextColored(colorMuted, "%s", description);
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+}
+
+void App::frame()
+{
+    pollCheck();
+    pollTask();
+    if (m_pendingAction && !m_checking && !m_task) {
+        m_pendingAction = false;
+        if (m_page == Page::Build && buildBlocker().empty()) {
+            startTask(TaskKind::Build, "Building", buildCommand());
+        } else if (m_page == Page::Server && domainValid()) {
+            startTask(TaskKind::TestServer, "Testing the server",
+                      "echo \"HTTP $(curl -s -o /dev/null -w '%{http_code}' --max-time 8 " + shellQuote("http://naswii." + m_settings.domain + "/w0") + ")\"");
+        } else if (m_page == Page::Install) {
+            m_installOk = install(m_installMessage);
+        }
+    }
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->WorkPos);
+    ImGui::SetNextWindowSize(viewport->WorkSize);
+    ImGui::Begin("Patcher", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    float logHeight = (m_task || !m_log.empty()) ? std::max(180.0f, ImGui::GetContentRegionAvail().y * 0.32f) : 0.0f;
+
+    ImGui::BeginChild("sidebar", ImVec2(230, -logHeight - (logHeight > 0 ? ImGui::GetStyle().ItemSpacing.y : 0)), ImGuiChildFlags_Borders);
+    drawSidebar();
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("page", ImVec2(0, -logHeight - (logHeight > 0 ? ImGui::GetStyle().ItemSpacing.y : 0)), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+    switch (m_page) {
+    case Page::Requirements:
+        drawRequirements();
+        break;
+    case Page::Server:
+        drawServer();
+        break;
+    case Page::Keys:
+        drawKeys();
+        break;
+    case Page::Build:
+        drawBuild();
+        break;
+    case Page::Install:
+        drawInstall();
+        break;
+    case Page::Gecko:
+        drawGecko();
+        break;
+    }
+    ImGui::EndChild();
+
+    if (logHeight > 0) {
+        drawLog(logHeight);
+    }
+    ImGui::End();
+
+    if (m_settingsDirty) {
+        m_settings.save(m_settingsFile);
+        m_settingsDirty = false;
+    }
+}
+
+void App::drawSidebar()
+{
+    if (m_boldFont) {
+        ImGui::PushFont(m_boldFont);
+    }
+    ImGui::TextColored(colorAccent, "DWC Server Advanced");
+    if (m_boldFont) {
+        ImGui::PopFont();
+    }
+    ImGui::TextColored(colorMuted, "Client patcher");
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    KeyStatus keys = keyStatus();
+    BuildOutput output = buildOutput();
+    struct Item {
+        Page page;
+        const char* label;
+        bool done;
+    };
+    const Item items[] = {
+        {Page::Requirements, "1  Requirements", m_requirements.ready() && repoValid() && !makeScriptHasCRLF()},
+        {Page::Server, "2  Server", domainValid()},
+        {Page::Keys, "3  Signing key", keys.privateKey},
+        {Page::Build, "4  Build", output.stage1 && output.payloads > 0},
+        {Page::Install, "5  Install", m_installOk},
+        {Page::Gecko, "6  Gecko codes", output.gecko > 0},
+    };
+    for (const Item& item : items) {
+        ImGui::PushID(static_cast<int>(item.page));
+        if (ImGui::Selectable(item.label, m_page == item.page, 0, ImVec2(0, 30))) {
+            m_page = item.page;
+            if (item.page == Page::Gecko) {
+                refreshGecko();
+            }
+        }
+        if (item.done) {
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 6);
+            ImGui::TextColored(colorOk, "*");
+        }
+        ImGui::PopID();
+    }
+
+    ImGui::SetCursorPosY(ImGui::GetWindowHeight() - ImGui::GetTextLineHeightWithSpacing() * 3.2f);
+    ImGui::Separator();
+    if (m_task) {
+        ImGui::TextColored(colorAccent, "%s...", m_taskTitle.c_str());
+        ImGui::TextColored(colorMuted, "%.0f s", m_taskSeconds);
+    } else if (m_lastTask != TaskKind::None) {
+        ImGui::TextColored(m_lastExitCode == 0 ? colorOk : colorBad, m_lastExitCode == 0 ? "Last task finished" : "Last task failed");
+    } else {
+        ImGui::TextColored(colorMuted, "Idle");
+    }
+}
+
+void App::drawRequirements()
+{
+    heading("Requirements", "The patcher is built with its own make.sh, which needs bash, devkitPPC and Python 3.11+ with the cryptography module. This page checks them and the patcher folder.");
+
+    ImGui::SeparatorText("Patcher folder");
+    std::string repo = m_settings.repo;
+    ImGui::SetNextItemWidth(-110);
+    if (ImGui::InputText("##repo", &repo)) {
+        m_settings.repo = repo;
+        markDirty();
+        refreshGecko();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...##repo")) {
+        if (auto chosen = pickFolder("Choose the dwc-server-advanced-patcher folder", repoPath())) {
+            m_settings.repo = pathToUtf8(*chosen);
+            markDirty();
+            refreshGecko();
+            startCheck();
+        }
+    }
+    statusLine(repoValid(), "Patcher folder", repoValid() ? "make.sh and gamedefs.csv found" : "",
+               "Choose the folder of dwc-server-advanced-patcher (it contains make.sh and gamedefs.csv).");
+    if (repoValid() && makeScriptHasCRLF()) {
+        statusLine(false, "make.sh line endings", "Windows (CRLF)",
+                   "Git checked make.sh out with Windows line endings, which bash cannot run. Fix converts it to Unix line endings; the repository's .gitattributes keeps it that way.");
+        ImGui::Indent(56);
+        if (primaryButton("Fix line endings")) {
+            fixMakeScript();
+        }
+        ImGui::Unindent(56);
+    }
+
+    ImGui::SeparatorText("Shell");
+    if (m_shells.empty()) {
+#ifdef _WIN32
+        statusLine(false, "bash", "", "Install WSL (wsl --install in an administrator terminal, then install devkitPPC inside it) or the devkitPro installer, which comes with MSYS2.");
+#else
+        statusLine(false, "bash", "", "Install bash.");
+#endif
+    } else {
+        ImGui::SetNextItemWidth(320);
+        if (ImGui::BeginCombo("##shell", currentShell() ? currentShell()->label.c_str() : "")) {
+            for (const Shell& shell : m_shells) {
+                if (ImGui::Selectable(shell.label.c_str(), currentShell() == &shell)) {
+                    m_settings.shell = shell.label;
+                    markDirty();
+                    startCheck();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(colorMuted, "runs make.sh");
+    }
+
+    ImGui::SeparatorText("Tools");
+    if (m_checking) {
+        ImGui::TextColored(colorAccent, "Checking...");
+    } else if (m_requirements.checked) {
+        const Requirements& r = m_requirements;
+        statusLine(r.shellOk, "bash", r.shellOk ? (currentShell() ? currentShell()->label : "") : r.shellError,
+                   "The shell could not be started. With WSL, open a terminal and run wsl once to finish its setup.");
+        if (r.shellOk) {
+            statusLine(!r.devkitPPC.empty(), "devkitPPC", r.devkitPPC.empty() ? "" : r.gcc,
+                       "Install devkitPPC from devkitPro (https://devkitpro.org/wiki/Getting_Started). In WSL: install devkitpro-pacman, then sudo dkp-pacman -S devkitPPC.");
+            statusLine(r.pythonOk, "Python 3.11+", r.python,
+                       "Install Python 3.11 or newer (sudo apt install python3 in WSL or Ubuntu).");
+            statusLine(!r.cryptography.empty(), "cryptography", r.cryptography,
+                       "Install the module: python3 -m pip install cryptography (or sudo apt install python3-cryptography).");
+            statusLine(!r.curl.empty(), "curl", r.curl.empty() ? "optional" : r.curl, "Optional: only used to test the server.");
+        }
+    }
+    ImGui::Spacing();
+    if (ImGui::Button("Check again")) {
+        startCheck();
+    }
+    if (m_requirements.ready() && repoValid()) {
+        ImGui::SameLine();
+        if (primaryButton("Next: server")) {
+            m_page = Page::Server;
+        }
+    }
+}
+
+void App::drawServer()
+{
+    heading("Server", "The domain is built into the patch, so players' games connect to it. Use the domain your dwc-server-advanced is reachable on, without naswii. or other prefixes.");
+
+    ImGui::SeparatorText("Domain");
+    ImGui::SetNextItemWidth(360);
+    if (ImGui::InputTextWithHint("##domain", "wfc.example.com", &m_settings.domain, ImGuiInputTextFlags_CharsNoBlank)) {
+        markDirty();
+        m_serverTest.clear();
+    }
+    if (!m_settings.domain.empty() && !domainValid()) {
+        ImGui::TextColored(colorBad, "Use only letters, digits, dots and hyphens.");
+    } else if (domainValid()) {
+        ImGui::TextColored(colorMuted, "Games will connect to naswii.%s, gpcm.%s and the other hostnames (docs/HOSTNAMES.md on the server).",
+                           m_settings.domain.c_str(), m_settings.domain.c_str());
+    }
+    ImGui::Spacing();
+    ImGui::BeginDisabled(!domainValid() || m_task != nullptr || m_requirements.curl.empty());
+    if (ImGui::Button("Test the server")) {
+        startTask(TaskKind::TestServer, "Testing the server",
+                  "echo \"HTTP $(curl -s -o /dev/null -w '%{http_code}' --max-time 8 " + shellQuote("http://naswii." + m_settings.domain + "/w0") + ")\"");
+    }
+    ImGui::EndDisabled();
+    if (!m_serverTest.empty()) {
+        ImGui::SameLine();
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextColored(m_serverTest.find("200") != std::string::npos ? colorOk : colorWarn, "%s", m_serverTest.c_str());
+        ImGui::PopTextWrapPos();
+    }
+
+    ImGui::SeparatorText("Server folder");
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextColored(colorMuted, "The folder of the server with config.yml (Panel -> Server -> Files shows it). The Install step copies the build into its payload/ folder. Leave it empty if the server runs on another machine: then upload dist/ in the panel's Files tab.");
+    ImGui::PopTextWrapPos();
+    ImGui::SetNextItemWidth(-110);
+    if (ImGui::InputText("##serverdir", &m_settings.serverDir)) {
+        markDirty();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...##server")) {
+        if (auto chosen = pickFolder("Choose the dwc-server-advanced server folder", pathFromUtf8(m_settings.serverDir))) {
+            m_settings.serverDir = pathToUtf8(*chosen);
+            markDirty();
+        }
+    }
+    if (!m_settings.serverDir.empty()) {
+        fs::path server = pathFromUtf8(m_settings.serverDir);
+        bool hasConfig = fs::exists(server / "config.yml") || fs::exists(server / "config.yaml");
+        statusLine(hasConfig, "Server folder", hasConfig ? "config.yml found" : "", "No config.yml in this folder: is it the server folder?");
+    }
+    ImGui::Spacing();
+    if (primaryButton("Next: signing key", domainValid())) {
+        m_page = Page::Keys;
+    }
+}
+
+void App::drawKeys()
+{
+    heading("Signing key", "The server signs every game payload with a private key, and stage 1 only accepts payloads signed with the matching public key. The first build creates the key pair; keep using the same one afterwards.");
+
+    KeyStatus keys = keyStatus();
+    statusLine(keys.privateKey, "Private key", keys.privateKey ? "misc/private-key-OUT.pem" : "",
+               "No key yet. The first build creates one automatically.");
+    if (keys.privateKey) {
+        statusLine(keys.publicKeyMatches, "Public key in the build", keys.publicKeyMatches ? "include/wwfcPayloadPublicKey.hpp" : "",
+                   "include/wwfcPayloadPublicKey.hpp does not match your key: clients would reject the payloads. Generate the keys again, or copy misc/wwfcPayloadPublicKey-OUT.hpp there.");
+        if (keys.distKey) {
+            statusLine(keys.distMatches, "Key in dist/", keys.distMatches ? "dist/private-key.pem matches" : "",
+                       "dist/private-key.pem is from another key. Build again before installing.");
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, colorWarn);
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextUnformatted("Keep misc/private-key-OUT.pem and dist/private-key.pem private: anyone who has them can run code on your players' consoles. They are excluded from git.");
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+
+    ImGui::Spacing();
+    ImGui::BeginDisabled(m_task != nullptr || !m_requirements.ready());
+    if (ImGui::Button(keys.privateKey ? "Generate a new key pair..." : "Generate the key pair")) {
+        if (keys.privateKey) {
+            m_confirmKeys = true;
+            ImGui::OpenPopup("Replace the key?");
+        } else {
+            startTask(TaskKind::Keys, "Generating keys", "bash ./make.sh --keys");
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (primaryButton("Next: build")) {
+        m_page = Page::Build;
+    }
+
+    if (ImGui::BeginPopupModal("Replace the key?", &m_confirmKeys, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("A new key makes every installed stage 1 and payload invalid.");
+        ImGui::TextUnformatted("You then have to build everything again and install it on the server.");
+        ImGui::Spacing();
+        if (ImGui::Button("Generate a new key")) {
+            startTask(TaskKind::Keys, "Generating keys", "bash ./make.sh --keys");
+            m_confirmKeys = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            m_confirmKeys = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+// buildCommand is the make.sh call for the chosen options, the same command
+// the patcher README describes.
+std::string App::buildCommand() const
+{
+    std::string command = "bash ./make.sh";
+    if (m_settings.clean) command += " --clean";
+    if (!keyStatus().privateKey) command += " --keys";
+    if (m_settings.buildPayload) command += " --payload";
+    if (m_settings.buildStage1) command += " --stage1";
+    if (m_settings.buildPatch) command += " --patch";
+    if (m_settings.buildExploit) command += " --exploit";
+    command += " -- -j" + std::to_string(m_settings.jobs) + " " + shellQuote("-DWWFC_DOMAIN=\"" + m_settings.domain + "\"");
+    if (!m_settings.gameFilter.empty()) {
+        command += " -g" + m_settings.gameFilter;
+    }
+    return command;
+}
+
+std::string App::buildBlocker() const
+{
+    if (!repoValid()) return "Choose the patcher folder first.";
+    if (makeScriptHasCRLF()) return "Fix the line endings of make.sh first (Requirements).";
+    if (!m_requirements.ready()) return m_checking ? "Checking the requirements..." : "Fix the requirements first.";
+    if (!domainValid()) return "Set the server domain first.";
+    if (!(m_settings.buildPayload || m_settings.buildStage1 || m_settings.buildPatch || m_settings.buildExploit)) {
+        return "Choose something to build.";
+    }
+    return "";
+}
+
+void App::runAction()
+{
+    m_pendingAction = true;
+}
+
+void App::drawBuild()
+{
+    heading("Build", "Runs make.sh with the options below. Everything ends up in dist/ (stage 1, payloads, key), exploit/sbcm/ and patch/build/ (Gecko codes).");
+
+    KeyStatus keys = keyStatus();
+    std::string command = buildCommand();
+    std::string blocker = buildBlocker();
+    if (m_task) {
+        if (ImGui::Button("Cancel")) {
+            m_task->kill();
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(colorAccent, "%s... %.0f s", m_taskTitle.c_str(), m_taskSeconds);
+    } else {
+        if (primaryButton("Build", blocker.empty())) {
+            startTask(TaskKind::Build, "Building", command);
+        }
+        if (!blocker.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(colorWarn, "%s", blocker.c_str());
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!m_requirements.ready());
+        if (ImGui::Button("Clean only")) {
+            startTask(TaskKind::Clean, "Cleaning", "bash ./make.sh --clean");
+        }
+        ImGui::EndDisabled();
+    }
+
+    ImGui::Spacing();
+
+    bool changed = false;
+    ImGui::SeparatorText("What to build");
+    changed |= ImGui::Checkbox("Game payloads (stage 2)", &m_settings.buildPayload);
+    changed |= ImGui::Checkbox("Stage 1 loader", &m_settings.buildStage1);
+    changed |= ImGui::Checkbox("Gecko codes (stage 0)", &m_settings.buildPatch);
+    changed |= ImGui::Checkbox("Mario Kart Wii SBCM exploit", &m_settings.buildExploit);
+    changed |= ImGui::Checkbox("Clean old build output first", &m_settings.clean);
+
+    ImGui::SeparatorText("Options");
+    ImGui::SetNextItemWidth(220);
+    changed |= ImGui::SliderInt("Parallel jobs", &m_settings.jobs, 1, 32);
+    ImGui::SetNextItemWidth(220);
+    changed |= ImGui::InputTextWithHint("Only games starting with", "e.g. RMC (empty: all games)", &m_settings.gameFilter, ImGuiInputTextFlags_CharsUppercase | ImGuiInputTextFlags_CharsNoBlank);
+    if (changed) {
+        markDirty();
+    }
+
+    ImGui::SeparatorText("Command");
+    if (m_monoFont) {
+        ImGui::PushFont(m_monoFont);
+    }
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextColored(colorMuted, "%s", command.c_str());
+    ImGui::PopTextWrapPos();
+    if (m_monoFont) {
+        ImGui::PopFont();
+    }
+    if (!keys.privateKey) {
+        ImGui::TextColored(colorWarn, "No signing key yet: this build creates one.");
+    }
+
+    if (m_lastTask == TaskKind::Build && !m_task) {
+        ImGui::Spacing();
+        if (m_lastExitCode == 0) {
+            ImGui::TextColored(colorOk, "Build finished in %.0f s.", m_taskSeconds);
+            ImGui::SameLine();
+            if (primaryButton("Next: install")) {
+                m_page = Page::Install;
+            }
+        } else {
+            ImGui::TextColored(colorBad, "The build failed. The log below shows the error.");
+        }
+    }
+}
+
+void App::drawInstall()
+{
+    heading("Install", "Copies the build into the server's payload/ folder: dist/ (stage1.bin, binary/, private-key.pem) and exploit/sbcm/*.bin into payload/sbcm/.");
+
+    BuildOutput output = buildOutput();
+    KeyStatus keys = keyStatus();
+    statusLine(output.stage1, "Stage 1", output.stage1 ? "dist/stage1.bin" : "", "Build stage 1 first.");
+    statusLine(output.payloads > 0, "Game payloads", output.payloads > 0 ? std::to_string(output.payloads) + " in dist/binary" : "", "Build the payloads first.");
+    statusLine(output.key && keys.distMatches, "Signing key", output.key ? (keys.distMatches ? "dist/private-key.pem" : "does not match misc/private-key-OUT.pem") : "",
+               "dist/private-key.pem is missing or from another key: build again.");
+    statusLine(output.sbcm > 0, "SBCM exploits", output.sbcm > 0 ? std::to_string(output.sbcm) + " in exploit/sbcm" : "optional", "Optional: only for patching Mario Kart Wii during matchmaking.");
+
+    ImGui::SeparatorText("Destination");
+    if (m_settings.serverDir.empty()) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextColored(colorWarn, "No server folder set (step 2). If the server runs on another machine, open its panel, go to Server -> Files and upload the content of dist/ into payload/ and exploit/sbcm into payload/sbcm.");
+        ImGui::PopTextWrapPos();
+        if (ImGui::Button("Open dist/")) {
+            openInFileManager(repoPath() / "dist");
+        }
+    } else {
+        fs::path payload = pathFromUtf8(m_settings.serverDir) / "payload";
+        if (m_monoFont) {
+            ImGui::PushFont(m_monoFont);
+        }
+        ImGui::TextUnformatted(pathToUtf8(payload).c_str());
+        if (m_monoFont) {
+            ImGui::PopFont();
+        }
+        ImGui::Spacing();
+        if (primaryButton("Install into the server", output.stage1 && output.payloads > 0 && keys.distMatches)) {
+            m_installOk = install(m_installMessage);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Open payload/")) {
+            std::error_code ignored;
+            fs::create_directories(payload, ignored);
+            openInFileManager(payload);
+        }
+    }
+    if (!m_installMessage.empty()) {
+        ImGui::Spacing();
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextColored(m_installOk ? colorOk : colorBad, "%s", m_installMessage.c_str());
+        ImGui::PopTextWrapPos();
+        if (m_installOk && ImGui::Button("Next: Gecko codes")) {
+            m_page = Page::Gecko;
+            refreshGecko();
+        }
+    }
+    ImGui::Spacing();
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextColored(colorMuted, "On the server, leave payloadServerAddress empty (Panel -> Server -> Settings -> Network) so it serves and signs the payloads itself.");
+    ImGui::PopTextWrapPos();
+}
+
+void App::drawGecko()
+{
+    heading("Gecko codes", "Players apply the Gecko code for their game and region (USB loader, Riivolution or Dolphin's cheat manager). Mario Kart Wii players who reach the server through DNS are patched automatically.");
+
+    if (m_geckoFiles.empty()) {
+        ImGui::TextColored(colorWarn, "No Gecko codes yet: build with \"Gecko codes (stage 0)\" enabled.");
+        return;
+    }
+
+    ImGui::SetNextItemWidth(260);
+    ImGui::InputTextWithHint("##geckofilter", "Search, e.g. RMCP", &m_geckoFilter, ImGuiInputTextFlags_CharsUppercase);
+    ImGui::SameLine();
+    if (ImGui::Button("Open folder")) {
+        openInFileManager(repoPath() / "patch" / "build");
+    }
+    ImGui::SameLine();
+    ImGui::TextColored(colorMuted, "%d games", static_cast<int>(m_geckoFiles.size()));
+
+    ImGui::BeginChild("geckolist", ImVec2(260, 0), ImGuiChildFlags_Borders);
+    for (const std::string& name : m_geckoFiles) {
+        if (!m_geckoFilter.empty() && name.find(m_geckoFilter) == std::string::npos) {
+            continue;
+        }
+        std::string label = name;
+        if (name.size() >= 4) {
+            const char* region = regionName(name[3]);
+            if (*region) {
+                label += "   ";
+                label += region;
+            }
+        }
+        if (ImGui::Selectable(label.c_str(), m_geckoSelected == name)) {
+            m_geckoSelected = name;
+            m_geckoContent = readFile(repoPath() / "patch" / "build" / pathFromUtf8(name + ".txt")).value_or("");
+        }
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("geckocode", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+    if (m_geckoSelected.empty()) {
+        ImGui::TextColored(colorMuted, "Choose a game on the left.");
+    } else {
+        if (m_boldFont) {
+            ImGui::PushFont(m_boldFont);
+        }
+        ImGui::TextUnformatted(m_geckoSelected.c_str());
+        if (m_boldFont) {
+            ImGui::PopFont();
+        }
+        ImGui::SameLine();
+        if (primaryButton("Copy")) {
+            ImGui::SetClipboardText(m_geckoContent.c_str());
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(colorMuted, "patch/build/%s.txt", m_geckoSelected.c_str());
+        if (m_monoFont) {
+            ImGui::PushFont(m_monoFont);
+        }
+        ImGui::InputTextMultiline("##code", &m_geckoContent, ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+        if (m_monoFont) {
+            ImGui::PopFont();
+        }
+    }
+    ImGui::EndChild();
+}
+
+void App::drawLog(float height)
+{
+    ImGui::BeginChild("log", ImVec2(0, height), ImGuiChildFlags_Borders);
+    ImGui::TextColored(m_task ? colorAccent : colorMuted, "%s", m_task ? (m_taskTitle + "...").c_str() : "Output of the last task");
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 180);
+    if (ImGui::SmallButton("Copy log")) {
+        std::string all;
+        for (const std::string& line : m_log) {
+            all += line + "\n";
+        }
+        ImGui::SetClipboardText(all.c_str());
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(m_task != nullptr);
+    if (ImGui::SmallButton("Clear")) {
+        m_log.clear();
+        m_lastTask = TaskKind::None;
+    }
+    ImGui::EndDisabled();
+
+    ImGui::BeginChild("loglines", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+    if (m_monoFont) {
+        ImGui::PushFont(m_monoFont);
+    }
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(m_log.size()));
+    while (clipper.Step()) {
+        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+            const std::string& line = m_log[i];
+            std::string lower = line;
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+            bool error = lower.find("error") != std::string::npos || lower.find("failed") != std::string::npos ||
+                         lower.find("traceback") != std::string::npos;
+            bool command = line.rfind("$ ", 0) == 0;
+            if (error) {
+                ImGui::TextColored(colorBad, "%s", line.c_str());
+            } else if (command) {
+                ImGui::TextColored(colorAccent, "%s", line.c_str());
+            } else {
+                ImGui::TextUnformatted(line.c_str());
+            }
+        }
+    }
+    if (m_monoFont) {
+        ImGui::PopFont();
+    }
+    if (m_logFollow && m_logScrollPending) {
+        ImGui::SetScrollHereY(1.0f);
+        m_logScrollPending = false;
+    }
+    if (ImGui::GetScrollY() < ImGui::GetScrollMaxY() - 4 && ImGui::IsWindowHovered() && ImGui::GetIO().MouseWheel != 0) {
+        m_logFollow = false;
+    } else if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4) {
+        m_logFollow = true;
+    }
+    ImGui::EndChild();
+    ImGui::EndChild();
+}

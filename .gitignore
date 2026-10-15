@@ -1,0 +1,62 @@
+# Prerequisites
+*.d
+
+# Local scripts
+*.bat
+*.sh
+
+!make.sh
+dist/
+
+# Editor files
+.vscode
+*.kate-swp
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# OS generated files
+.DS_Store
+ehthumbs.db
+Thumbs.db
+
+# Output
+stage1/build
+patch/build
+patch/build_tool
+payload/build
+payload/binary
+exploit/build
+exploit/sbcm
+launcher/build
+*.elf
+*.out
+*.dol
+*.wad
+*.app
+
+# Build keys: never publish the signing key
+misc/*-OUT.pem
+misc/*-OUT.hpp
+
+# Patcher GUI build output and local settings
+gui/build/
+.patcher-gui-*.sh
+!gui/build-windows.bat

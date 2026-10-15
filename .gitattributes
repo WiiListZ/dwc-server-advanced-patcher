@@ -1,0 +1,8 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Shell scripts run in bash (WSL, MSYS2, Linux): never check them out with CRLF.
+*.sh text eol=lf
+
+# Batch files need Windows line endings.
+*.bat text eol=crlf
