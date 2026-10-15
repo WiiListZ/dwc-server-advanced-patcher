@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 
@@ -132,6 +133,15 @@ HttpProbe probeHttp(const std::string& url)
     return probe;
 }
 
+bool supportsCertificateSetup(const std::string& output)
+{
+    int major = 0, minor = 0, patch = 0;
+    if (std::sscanf(output.c_str(), "dwc-server-advanced v%d.%d.%d", &major, &minor, &patch) != 3) {
+        return false;
+    }
+    return major > 1 || (major == 1 && (minor > 0 || (minor == 0 && patch >= 2)));
+}
+
 } // namespace
 
 // ----- Settings -------------------------------------------------------------
@@ -218,6 +228,9 @@ App::~App()
     }
     if (m_serverTestThread.joinable()) {
         m_serverTestThread.join();
+    }
+    if (m_certThread.joinable()) {
+        m_certThread.join();
     }
     m_settings.save(m_settingsFile);
 }
@@ -554,6 +567,71 @@ void App::pollServerTest()
     appendLog(m_serverTest);
 }
 
+void App::startCertificateSetup()
+{
+    if (m_certGenerating || m_task || m_settings.serverDir.empty()) {
+        return;
+    }
+    if (m_certThread.joinable()) {
+        m_certThread.join();
+    }
+    const fs::path folder = pathFromUtf8(m_settings.serverDir);
+    m_certMessage.clear();
+    m_certOk = false;
+    m_certGenerating = true;
+    m_certDone = false;
+    m_certThread = std::thread([this, folder] {
+        std::string message;
+        bool ok = false;
+        std::error_code error;
+        for (const auto& entry : fs::directory_iterator(folder, error)) {
+            if (error) break;
+            const std::string name = pathToUtf8(entry.path().filename());
+            if (name.rfind("dwc-server-advanced", 0) != 0 || !entry.is_regular_file()) continue;
+#ifdef _WIN32
+            if (entry.path().extension() != ".exe") continue;
+#elif defined(__APPLE__)
+            if (name.find("darwin") == std::string::npos) continue;
+#else
+            if (name.find("linux") == std::string::npos) continue;
+#endif
+            const std::string executable = pathToUtf8(entry.path());
+            CaptureResult version = runCapture({executable, "--version"}, folder);
+            if (version.exitCode != 0 || !supportsCertificateSetup(trim(version.output))) continue;
+            CaptureResult generated = runCapture({executable, "--dir", pathToUtf8(folder), "--generate-https"}, folder);
+            ok = generated.exitCode == 0;
+            message = trim(generated.output);
+            if (message.empty()) message = generated.error;
+            if (message.empty()) message = ok ? "HTTPS files are ready. Restart the server to load them."
+                                              : "Certificate generation failed; check the server configuration and Dolphin certificate files.";
+            if (ok) message += " Restart the server to load the certificates.";
+            break;
+        }
+        if (message.empty()) {
+            message = error ? "Cannot inspect the server folder: " + error.message()
+                            : "No dwc-server-advanced v1.0.2 or newer executable was found in this folder. Update the server first.";
+        }
+        std::lock_guard lock(m_certMutex);
+        m_certResult = std::move(message);
+        m_certResultOk = ok;
+        m_certDone = true;
+    });
+}
+
+void App::pollCertificateSetup()
+{
+    if (!m_certGenerating) return;
+    {
+        std::lock_guard lock(m_certMutex);
+        if (!m_certDone) return;
+        m_certMessage = m_certResult;
+        m_certOk = m_certResultOk;
+    }
+    m_certThread.join();
+    m_certGenerating = false;
+    appendLog(m_certMessage);
+}
+
 // ----- Tasks ------------------------------------------------------------------
 
 bool App::startTask(TaskKind kind, const std::string& title, const std::string& command)
@@ -777,8 +855,9 @@ void App::frame()
     pollCheck();
     pollSourceInstall();
     pollServerTest();
+    pollCertificateSetup();
     pollTask();
-    if (m_pendingAction && !m_checking && !m_task && !m_serverTesting) {
+    if (m_pendingAction && !m_checking && !m_task && !m_serverTesting && !m_certGenerating) {
         m_pendingAction = false;
         if (m_page == Page::Build && buildBlocker().empty()) {
             startTask(TaskKind::Build, "Building", buildCommand());
@@ -951,7 +1030,7 @@ void App::drawRequirements()
     }
     ImGui::EndDisabled();
     statusLine(repoValid(), "Patcher folder", repoValid() ? "make.sh and gamedefs.csv found" : "",
-               "Choose a folder, then download the v1.0.0 patcher source into it. You can use the program's folder.");
+               "Choose a folder, then download the v1.0.1 patcher source into it. You can use the program's folder.");
     ImGui::BeginDisabled(m_sourceInstalling || m_checking || m_task != nullptr);
     if (ImGui::Button("Use program folder")) {
         m_settings.repo = pathToUtf8(executableDir());
@@ -1079,21 +1158,40 @@ void App::drawServer()
     ImGui::PushTextWrapPos(0);
     ImGui::TextColored(colorMuted, "The folder of the server with config.yml (Panel -> Server -> Files shows it). The Install step copies the build into its payload/ folder. Leave it empty if the server runs on another machine: then upload dist/ in the panel's Files tab.");
     ImGui::PopTextWrapPos();
+    ImGui::BeginDisabled(m_certGenerating);
     ImGui::SetNextItemWidth(-110);
     if (ImGui::InputText("##serverdir", &m_settings.serverDir)) {
         markDirty();
+        m_certMessage.clear();
     }
     ImGui::SameLine();
     if (ImGui::Button("Browse...##server")) {
         if (auto chosen = pickFolder("Choose the dwc-server-advanced server folder", pathFromUtf8(m_settings.serverDir))) {
             m_settings.serverDir = pathToUtf8(*chosen);
             markDirty();
+            m_certMessage.clear();
         }
     }
+    ImGui::EndDisabled();
     if (!m_settings.serverDir.empty()) {
         fs::path server = pathFromUtf8(m_settings.serverDir);
         bool hasConfig = fs::exists(server / "config.yml") || fs::exists(server / "config.yaml");
         statusLine(hasConfig, "Server folder", hasConfig ? "config.yml found" : "", "No config.yml in this folder: is it the server folder?");
+    }
+    ImGui::SeparatorText("HTTPS certificates");
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextColored(colorMuted, "The server v1.0.2+ creates missing HTTPS files using its config.yml. Wii and DS exploit certificates need Dolphin's clientca.pem and clientcakey.pem on this computer. Existing keys are preserved.");
+    ImGui::PopTextWrapPos();
+    const fs::path serverFolder = pathFromUtf8(m_settings.serverDir);
+    const bool hasServerConfig = !m_settings.serverDir.empty() &&
+        (fs::exists(serverFolder / "config.yml") || fs::exists(serverFolder / "config.yaml"));
+    if (primaryButton(m_certGenerating ? "Generating..." : "Create HTTPS certificates", hasServerConfig && !m_certGenerating && m_task == nullptr)) {
+        startCertificateSetup();
+    }
+    if (!m_certMessage.empty()) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextColored(m_certOk ? colorOk : colorWarn, "%s", m_certMessage.c_str());
+        ImGui::PopTextWrapPos();
     }
     ImGui::Spacing();
     if (primaryButton("Next: signing key", domainValid())) {

@@ -95,7 +95,7 @@ public:
     // action requested with runAction has not started yet.
     bool busy() const
     {
-        return m_checking || m_sourceInstalling || m_serverTesting || m_task != nullptr || m_pendingAction;
+        return m_checking || m_sourceInstalling || m_serverTesting || m_certGenerating || m_task != nullptr || m_pendingAction;
     }
 
     // lastExitCode is the exit code of the last finished task.
@@ -138,6 +138,8 @@ private:
     void pollSourceInstall();
     void startServerTest();
     void pollServerTest();
+    void startCertificateSetup();
+    void pollCertificateSetup();
     bool startTask(TaskKind kind, const std::string& title, const std::string& command);
     void pollTask();
     std::string scriptPrelude() const;
@@ -198,6 +200,16 @@ private:
     bool m_serverTestDone = false;
     std::string m_serverTestResult;
     bool m_serverTestResultOk = false;
+
+    // Runs the selected server's certificate generator outside the UI thread.
+    std::mutex m_certMutex;
+    std::thread m_certThread;
+    bool m_certGenerating = false;
+    bool m_certDone = false;
+    std::string m_certResult;
+    bool m_certResultOk = false;
+    std::string m_certMessage;
+    bool m_certOk = false;
 
     // The running task (build, keys, …) and its output.
     std::unique_ptr<Process> m_task;
