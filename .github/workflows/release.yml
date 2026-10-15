@@ -1,0 +1,84 @@
+# Builds the patcher GUI for Windows, Linux and macOS when a version tag
+# (v1.2.3) is pushed, and publishes them as a GitHub release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: cmd
+        working-directory: gui
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 || exit /b 1
+          cmake --build build --config Release || exit /b 1
+      - name: Stage
+        shell: bash
+        run: |
+          mkdir release
+          cp gui/build/Release/dwc-patcher-gui.exe release/dwc-patcher-gui_windows_x64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: release/*
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libgl1-mesa-dev xorg-dev
+      - name: Build
+        run: |
+          cmake -S gui -B gui/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build gui/build -j
+      - name: Stage
+        run: |
+          mkdir release
+          cp gui/build/dwc-patcher-gui release/dwc-patcher-gui_linux_x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: release/*
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S gui -B gui/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build gui/build -j
+      - name: Stage
+        run: |
+          mkdir release
+          cp gui/build/dwc-patcher-gui release/dwc-patcher-gui_macos_arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: release/*
+
+  release:
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect and checksum
+        run: |
+          mkdir release
+          find artifacts -type f -exec cp {} release/ \;
+          cd release && sha256sum * > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

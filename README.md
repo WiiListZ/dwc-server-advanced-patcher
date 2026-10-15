@@ -94,6 +94,8 @@ Settings are saved in `patcher-gui.ini` next to the program.
 
 ### Building the GUI
 
+Prebuilt binaries for Windows, Linux and macOS are attached to each [release](https://github.com/WiiListZ/dwc-server-advanced-patcher/releases). To build it yourself:
+
 The libraries (Dear ImGui 1.91.8 and GLFW 3.4) are downloaded by CMake, with fixed checksums.
 
 **Windows** (Visual Studio 2022 or newer with *Desktop development with C++*):
