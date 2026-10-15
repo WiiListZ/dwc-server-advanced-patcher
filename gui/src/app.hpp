@@ -2,6 +2,7 @@
 
 #include "platform.hpp"
 #include "process.hpp"
+#include "source_install.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -64,7 +65,6 @@ enum class TaskKind {
     Build,
     Keys,
     Clean,
-    TestServer,
 };
 
 class App
@@ -95,7 +95,7 @@ public:
     // action requested with runAction has not started yet.
     bool busy() const
     {
-        return m_checking || m_task != nullptr || m_pendingAction;
+        return m_checking || m_sourceInstalling || m_serverTesting || m_task != nullptr || m_pendingAction;
     }
 
     // lastExitCode is the exit code of the last finished task.
@@ -134,6 +134,10 @@ private:
     // Background work.
     void startCheck();
     void pollCheck();
+    void startSourceInstall();
+    void pollSourceInstall();
+    void startServerTest();
+    void pollServerTest();
     bool startTask(TaskKind kind, const std::string& title, const std::string& command);
     void pollTask();
     std::string scriptPrelude() const;
@@ -177,6 +181,24 @@ private:
     CaptureResult m_checkResult;
     Requirements m_requirements;
 
+    // Source download runs away from the drawing thread.
+    std::mutex m_sourceMutex;
+    std::thread m_sourceThread;
+    bool m_sourceInstalling = false;
+    bool m_sourceDone = false;
+    SourceInstallResult m_sourceResult;
+    std::string m_sourceMessage;
+    bool m_sourceOk = false;
+
+    // The HTTP checks use the host OS, not WSL or MSYS2, because the server
+    // may be running on Windows while the build shell has a separate network.
+    std::mutex m_serverTestMutex;
+    std::thread m_serverTestThread;
+    bool m_serverTesting = false;
+    bool m_serverTestDone = false;
+    std::string m_serverTestResult;
+    bool m_serverTestResultOk = false;
+
     // The running task (build, keys, …) and its output.
     std::unique_ptr<Process> m_task;
     TaskKind m_taskKind = TaskKind::None;
@@ -191,10 +213,16 @@ private:
 
     // Results shown on the pages.
     std::string m_serverTest;
+    bool m_serverTestOk = false;
     std::string m_installMessage;
     bool m_installOk = false;
     bool m_confirmKeys = false;
     bool m_pendingAction = false;
+
+    // Widths and heights of the draggable panels.
+    float m_sidebarWidth = 230.0f;
+    float m_logHeight = 250.0f;
+    float m_geckoWidth = 260.0f;
 
     // Gecko codes.
     std::vector<std::string> m_geckoFiles;

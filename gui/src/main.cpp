@@ -2,6 +2,7 @@
 // (make.sh) and installs the result into a dwc-server-advanced server.
 
 #include "app.hpp"
+#include "logo_pixels.hpp"
 
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_opengl3.h"
@@ -153,11 +154,17 @@ int main(int argc, char** argv)
         glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
         glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_FALSE);
     }
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
     GLFWwindow* window = glfwCreateWindow(1180, 780, "DWC Server Advanced - Client patcher", nullptr, nullptr);
     if (!window) {
         glfwTerminate();
         return 1;
     }
+    glfwSetWindowSizeLimits(window, 760, 520, GLFW_DONT_CARE, GLFW_DONT_CARE);
+#ifndef __APPLE__
+    GLFWimage icon{32, 32, const_cast<unsigned char*>(kLogoPixels)};
+    glfwSetWindowIcon(window, 1, &icon);
+#endif
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 

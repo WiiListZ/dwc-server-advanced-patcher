@@ -34,6 +34,7 @@ add_executable(dwc-patcher-gui
   src/app.cpp
   src/process.cpp
   src/platform.cpp
+  src/source_install.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -45,6 +46,8 @@ target_include_directories(dwc-patcher-gui PRIVATE src ${imgui_SOURCE_DIR})
 target_link_libraries(dwc-patcher-gui PRIVATE glfw OpenGL::GL)
 
 if(WIN32)
+  enable_language(RC)
+  target_sources(dwc-patcher-gui PRIVATE assets/logo.rc)
   # A window application: no console window next to the GUI.
   set_target_properties(dwc-patcher-gui PROPERTIES WIN32_EXECUTABLE TRUE)
   if(MSVC)
@@ -57,4 +60,22 @@ endif()
 if(UNIX AND NOT APPLE)
   find_package(Threads REQUIRED)
   target_link_libraries(dwc-patcher-gui PRIVATE Threads::Threads)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(source-install-test
+    tests/source_install_test.cpp
+    src/source_install.cpp
+    src/process.cpp
+    src/platform.cpp)
+  target_include_directories(source-install-test PRIVATE src)
+  if(MSVC)
+    target_compile_options(source-install-test PRIVATE /utf-8)
+    target_compile_definitions(source-install-test PRIVATE _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
+  endif()
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(source-install-test PRIVATE Threads::Threads)
+  endif()
+  add_test(NAME source-install COMMAND source-install-test)
 endif()

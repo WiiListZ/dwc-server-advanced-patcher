@@ -105,6 +105,33 @@ bool sameFileContent(const fs::path& a, const fs::path& b)
     return first && second && *first == *second;
 }
 
+struct HttpProbe {
+    int exitCode = -1;
+    std::string status;
+    std::string error;
+};
+
+HttpProbe probeHttp(const std::string& url)
+{
+#ifdef _WIN32
+    const char* curl = "curl.exe";
+    const char* sink = "NUL";
+#else
+    const char* curl = "curl";
+    const char* sink = "/dev/null";
+#endif
+    CaptureResult result = runCapture({curl, "--silent", "--show-error", "--noproxy", "*", "--output", sink,
+                                       "--write-out", "HTTP %{http_code}", "--max-time", "8", url}, executableDir());
+    HttpProbe probe;
+    probe.exitCode = result.exitCode;
+    size_t pos = result.output.rfind("HTTP ");
+    if (pos != std::string::npos && result.output.size() >= pos + 8) {
+        probe.status = result.output.substr(pos + 5, 3);
+    }
+    probe.error = trim(result.error.empty() ? result.output : result.error);
+    return probe;
+}
+
 } // namespace
 
 // ----- Settings -------------------------------------------------------------
@@ -166,6 +193,10 @@ App::App()
     m_shells = availableShells();
     if (!repoValid()) {
         findRepo();
+        if (m_settings.repo.empty()) {
+            m_settings.repo = pathToUtf8(executableDir() / "dwc-server-advanced-patcher");
+            markDirty();
+        }
     }
     if (m_settings.shell.empty() && !m_shells.empty()) {
         m_settings.shell = m_shells.front().label;
@@ -181,6 +212,12 @@ App::~App()
     }
     if (m_checkThread.joinable()) {
         m_checkThread.join();
+    }
+    if (m_sourceThread.joinable()) {
+        m_sourceThread.join();
+    }
+    if (m_serverTestThread.joinable()) {
+        m_serverTestThread.join();
     }
     m_settings.save(m_settingsFile);
 }
@@ -385,6 +422,138 @@ void App::pollCheck()
     m_requirements = req;
 }
 
+void App::startSourceInstall()
+{
+    if (m_sourceInstalling || m_checking || m_task) {
+        return;
+    }
+    if (m_settings.repo.empty()) {
+        m_sourceMessage = "Choose a patcher folder first.";
+        m_sourceOk = false;
+        return;
+    }
+    if (m_sourceThread.joinable()) {
+        m_sourceThread.join();
+    }
+    const fs::path target = repoPath();
+    m_sourceMessage.clear();
+    m_sourceInstalling = true;
+    m_sourceDone = false;
+    m_sourceThread = std::thread([this, target] {
+        SourceInstallResult result = installPatcherSource(target);
+        std::lock_guard lock(m_sourceMutex);
+        m_sourceResult = std::move(result);
+        m_sourceDone = true;
+    });
+}
+
+void App::pollSourceInstall()
+{
+    if (!m_sourceInstalling) {
+        return;
+    }
+    SourceInstallResult result;
+    {
+        std::lock_guard lock(m_sourceMutex);
+        if (!m_sourceDone) {
+            return;
+        }
+        result = m_sourceResult;
+    }
+    m_sourceThread.join();
+    m_sourceInstalling = false;
+    m_sourceOk = result.ok;
+    m_sourceMessage = result.message;
+    appendLog(result.message);
+    if (result.ok) {
+        refreshGecko();
+        startCheck();
+    }
+}
+
+void App::startServerTest()
+{
+    if (!domainValid() || m_serverTesting || m_task) {
+        return;
+    }
+    if (m_serverTestThread.joinable()) {
+        m_serverTestThread.join();
+    }
+    const std::string domain = m_settings.domain;
+    m_serverTest.clear();
+    m_serverTestOk = false;
+    m_serverTesting = true;
+    m_serverTestDone = false;
+    m_serverTestThread = std::thread([this, domain] {
+        std::string message;
+        bool ok = false;
+        if (domain == "localhost") {
+            const HttpProbe server = probeHttp("http://127.0.0.1/");
+            if (server.exitCode != 0) {
+                message = "The server is not reachable at 127.0.0.1:80 from this computer. " + server.error;
+            } else {
+                message = "Server running at 127.0.0.1:80 (HTTP " + server.status + "). ";
+                const HttpProbe stage = probeHttp("http://127.0.0.1/w0");
+                if (stage.status == "404") {
+                    message += "/w0 is missing: build and install stage1.bin. ";
+                } else if (stage.status == "200") {
+                    message += "Stage 1 is installed. ";
+                } else {
+                    message += "/w0 returned HTTP " + stage.status + ". ";
+                }
+                const HttpProbe name = probeHttp("http://nas.localhost/w0");
+                if (name.exitCode == 6) {
+                    message += "nas.localhost does not resolve. Use a local DNS name that points to this computer.";
+                } else if (name.exitCode != 0) {
+                    message += "nas.localhost cannot reach the server: " + name.error;
+                } else {
+                    message += "nas.localhost resolves (HTTP " + name.status + ").";
+                    ok = name.status == "200";
+                }
+            }
+        } else {
+            const std::string host = "nas." + domain;
+            const HttpProbe response = probeHttp("http://" + host + "/w0");
+            if (response.exitCode == 6) {
+                message = host + " does not resolve. Point it to the server IP in DNS.";
+            } else if (response.exitCode == 7) {
+                message = host + " resolves, but port 80 refuses the connection. Check the server address and firewall.";
+            } else if (response.exitCode != 0) {
+                message = "Cannot reach " + host + ": " + response.error;
+            } else if (response.status == "200") {
+                message = host + " serves stage 1 (HTTP 200).";
+                ok = true;
+            } else if (response.status == "404") {
+                message = host + " reaches the server, but /w0 is missing. Build and install stage1.bin.";
+            } else {
+                message = host + " returned HTTP " + response.status + ".";
+            }
+        }
+        std::lock_guard lock(m_serverTestMutex);
+        m_serverTestResult = std::move(message);
+        m_serverTestResultOk = ok;
+        m_serverTestDone = true;
+    });
+}
+
+void App::pollServerTest()
+{
+    if (!m_serverTesting) {
+        return;
+    }
+    {
+        std::lock_guard lock(m_serverTestMutex);
+        if (!m_serverTestDone) {
+            return;
+        }
+        m_serverTest = m_serverTestResult;
+        m_serverTestOk = m_serverTestResultOk;
+    }
+    m_serverTestThread.join();
+    m_serverTesting = false;
+    appendLog(m_serverTest);
+}
+
 // ----- Tasks ------------------------------------------------------------------
 
 bool App::startTask(TaskKind kind, const std::string& title, const std::string& command)
@@ -439,23 +608,6 @@ void App::pollTask()
     m_lastExitCode = m_task->exitCode();
     m_lastTask = m_taskKind;
     appendLog(m_lastExitCode == 0 ? "Finished." : "Failed with exit code " + std::to_string(m_lastExitCode) + ".");
-
-    if (m_taskKind == TaskKind::TestServer) {
-        std::string code;
-        for (auto it = m_log.rbegin(); it != m_log.rend(); ++it) {
-            if (it->rfind("HTTP ", 0) == 0) {
-                code = it->substr(5);
-                break;
-            }
-        }
-        if (code == "200") {
-            m_serverTest = "The server answers and serves stage 1 (HTTP 200).";
-        } else if (code == "000" || code.empty()) {
-            m_serverTest = "No answer from naswii." + m_settings.domain + ". Check the DNS records and that the server runs.";
-        } else {
-            m_serverTest = "The server answers with HTTP " + code + ": stage1.bin is probably not installed yet.";
-        }
-    }
 
     std::error_code ignored;
     fs::remove(repoPath() / ".patcher-gui-run.sh", ignored);
@@ -623,14 +775,15 @@ void App::heading(const char* title, const char* description)
 void App::frame()
 {
     pollCheck();
+    pollSourceInstall();
+    pollServerTest();
     pollTask();
-    if (m_pendingAction && !m_checking && !m_task) {
+    if (m_pendingAction && !m_checking && !m_task && !m_serverTesting) {
         m_pendingAction = false;
         if (m_page == Page::Build && buildBlocker().empty()) {
             startTask(TaskKind::Build, "Building", buildCommand());
         } else if (m_page == Page::Server && domainValid()) {
-            startTask(TaskKind::TestServer, "Testing the server",
-                      "echo \"HTTP $(curl -s -o /dev/null -w '%{http_code}' --max-time 8 " + shellQuote("http://naswii." + m_settings.domain + "/w0") + ")\"");
+            startServerTest();
         } else if (m_page == Page::Install) {
             m_installOk = install(m_installMessage);
         }
@@ -641,13 +794,27 @@ void App::frame()
     ImGui::SetNextWindowSize(viewport->WorkSize);
     ImGui::Begin("Patcher", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-    float logHeight = (m_task || !m_log.empty()) ? std::max(180.0f, ImGui::GetContentRegionAvail().y * 0.32f) : 0.0f;
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    const float divider = 7.0f;
+    const bool showLog = m_task || !m_log.empty();
+    m_sidebarWidth = std::clamp(m_sidebarWidth, 165.0f, std::max(165.0f, available.x - 320.0f));
+    if (showLog) {
+        m_logHeight = std::clamp(m_logHeight, 120.0f, std::max(120.0f, available.y - 180.0f));
+    }
+    const float verticalSpacing = ImGui::GetStyle().ItemSpacing.y;
+    const float pageHeight = showLog
+                                 ? std::max(120.0f, available.y - m_logHeight - divider - 2.0f * verticalSpacing)
+                                 : available.y;
 
-    ImGui::BeginChild("sidebar", ImVec2(230, -logHeight - (logHeight > 0 ? ImGui::GetStyle().ItemSpacing.y : 0)), ImGuiChildFlags_Borders);
+    ImGui::BeginChild("sidebar", ImVec2(m_sidebarWidth, pageHeight), ImGuiChildFlags_Borders);
     drawSidebar();
     ImGui::EndChild();
-    ImGui::SameLine();
-    ImGui::BeginChild("page", ImVec2(0, -logHeight - (logHeight > 0 ? ImGui::GetStyle().ItemSpacing.y : 0)), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::SameLine(0, 0);
+    ImGui::InvisibleButton("##sidebar-divider", ImVec2(divider, pageHeight));
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    if (ImGui::IsItemActive()) m_sidebarWidth += ImGui::GetIO().MouseDelta.x;
+    ImGui::SameLine(0, 0);
+    ImGui::BeginChild("page", ImVec2(0, pageHeight), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
     switch (m_page) {
     case Page::Requirements:
         drawRequirements();
@@ -670,8 +837,13 @@ void App::frame()
     }
     ImGui::EndChild();
 
-    if (logHeight > 0) {
-        drawLog(logHeight);
+    if (showLog) {
+        ImGui::InvisibleButton("##log-divider", ImVec2(-1, divider));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        if (ImGui::IsItemActive()) m_logHeight -= ImGui::GetIO().MouseDelta.y;
+        // The remaining region accounts for both ImGui item gaps, so the
+        // log's lower border stays inside the application window.
+        drawLog(std::max(1.0f, ImGui::GetContentRegionAvail().y));
     }
     ImGui::End();
 
@@ -683,6 +855,24 @@ void App::frame()
 
 void App::drawSidebar()
 {
+    const ImVec2 top = ImGui::GetCursorScreenPos();
+    const float unit = ImGui::GetFontSize() / 17.0f;
+    auto point = [&](float x, float y) { return ImVec2(top.x + x * unit, top.y + y * unit); };
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddCircleFilled(point(16, 16), 16 * unit, IM_COL32(166, 224, 248, 255));
+    draw->AddCircleFilled(point(16, 16), 13 * unit, IM_COL32(0, 160, 230, 255));
+    const ImU32 white = IM_COL32(255, 255, 255, 255);
+    for (float radius : {4.0f, 7.2f, 10.4f}) {
+        draw->PathClear();
+        draw->PathArcTo(point(11, 16), radius * unit, -3.14159265f / 4, 3.14159265f / 4);
+        draw->PathStroke(white, 0, 2.2f * unit);
+        const float diagonal = radius * 0.70710678f;
+        draw->AddCircleFilled(point(11 + diagonal, 16 - diagonal), 1.1f * unit, white);
+        draw->AddCircleFilled(point(11 + diagonal, 16 + diagonal), 1.1f * unit, white);
+    }
+    draw->AddCircleFilled(point(11, 16), 1.9f * unit, white);
+    ImGui::Dummy(ImVec2(32 * unit, 32 * unit));
+    ImGui::Spacing();
     if (m_boldFont) {
         ImGui::PushFont(m_boldFont);
     }
@@ -743,6 +933,7 @@ void App::drawRequirements()
 
     ImGui::SeparatorText("Patcher folder");
     std::string repo = m_settings.repo;
+    ImGui::BeginDisabled(m_sourceInstalling);
     ImGui::SetNextItemWidth(-110);
     if (ImGui::InputText("##repo", &repo)) {
         m_settings.repo = repo;
@@ -758,8 +949,30 @@ void App::drawRequirements()
             startCheck();
         }
     }
+    ImGui::EndDisabled();
     statusLine(repoValid(), "Patcher folder", repoValid() ? "make.sh and gamedefs.csv found" : "",
-               "Choose the folder of dwc-server-advanced-patcher (it contains make.sh and gamedefs.csv).");
+               "Choose a folder, then download the v1.0.0 patcher source into it. You can use the program's folder.");
+    ImGui::BeginDisabled(m_sourceInstalling || m_checking || m_task != nullptr);
+    if (ImGui::Button("Use program folder")) {
+        m_settings.repo = pathToUtf8(executableDir());
+        markDirty();
+        refreshGecko();
+        startCheck();
+    }
+    if (!repoValid()) {
+        ImGui::SameLine();
+        if (primaryButton("Download patcher here", !m_settings.repo.empty() && !m_checking)) {
+            startSourceInstall();
+        }
+    }
+    ImGui::EndDisabled();
+    if (m_sourceInstalling) {
+        ImGui::TextColored(colorAccent, "Downloading and installing the patcher source...");
+    } else if (!m_sourceMessage.empty()) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextColored(m_sourceOk ? colorOk : colorBad, "%s", m_sourceMessage.c_str());
+        ImGui::PopTextWrapPos();
+    }
     if (repoValid() && makeScriptHasCRLF()) {
         statusLine(false, "make.sh line endings", "Windows (CRLF)",
                    "Git checked make.sh out with Windows line endings, which bash cannot run. Fix converts it to Unix line endings; the repository's .gitattributes keeps it that way.");
@@ -807,7 +1020,8 @@ void App::drawRequirements()
                        "Install Python 3.11 or newer (sudo apt install python3 in WSL or Ubuntu).");
             statusLine(!r.cryptography.empty(), "cryptography", r.cryptography,
                        "Install the module: python3 -m pip install cryptography (or sudo apt install python3-cryptography).");
-            statusLine(!r.curl.empty(), "curl", r.curl.empty() ? "optional" : r.curl, "Optional: only used to test the server.");
+            statusLine(!r.curl.empty(), "curl", r.curl.empty() ? "optional for builds" : r.curl,
+                       "The shell uses curl to test the server. Source download also needs system curl and tar.");
         }
     }
     ImGui::Spacing();
@@ -824,31 +1038,40 @@ void App::drawRequirements()
 
 void App::drawServer()
 {
-    heading("Server", "The domain is built into the patch, so players' games connect to it. Use the domain your dwc-server-advanced is reachable on, without naswii. or other prefixes.");
+    heading("Server", "The host name is built into the patch. It needs DNS records that point to your server. Do not enter a bare IP address or localhost for other devices.");
 
     ImGui::SeparatorText("Domain");
+    ImGui::BeginDisabled(m_serverTesting);
     ImGui::SetNextItemWidth(360);
     if (ImGui::InputTextWithHint("##domain", "wfc.example.com", &m_settings.domain, ImGuiInputTextFlags_CharsNoBlank)) {
         markDirty();
         m_serverTest.clear();
     }
+    ImGui::EndDisabled();
     if (!m_settings.domain.empty() && !domainValid()) {
         ImGui::TextColored(colorBad, "Use only letters, digits, dots and hyphens.");
     } else if (domainValid()) {
-        ImGui::TextColored(colorMuted, "Games will connect to naswii.%s, gpcm.%s and the other hostnames (docs/HOSTNAMES.md on the server).",
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextColored(colorMuted, "Games will connect to nas.%s, gpcm.gs.%s and other hostnames.",
                            m_settings.domain.c_str(), m_settings.domain.c_str());
+        if (m_settings.domain == "localhost") {
+            ImGui::TextColored(colorWarn, "localhost only refers to this computer. The game also needs nas.localhost to resolve.");
+        } else if (std::all_of(m_settings.domain.begin(), m_settings.domain.end(), [](unsigned char c) {
+                       return std::isdigit(c) || c == '.';
+                   })) {
+            ImGui::TextColored(colorWarn, "A bare IP becomes nas.<IP> in the patch. Use a DNS name pointing to the IP instead.");
+        }
+        ImGui::PopTextWrapPos();
     }
     ImGui::Spacing();
-    ImGui::BeginDisabled(!domainValid() || m_task != nullptr || m_requirements.curl.empty());
-    if (ImGui::Button("Test the server")) {
-        startTask(TaskKind::TestServer, "Testing the server",
-                  "echo \"HTTP $(curl -s -o /dev/null -w '%{http_code}' --max-time 8 " + shellQuote("http://naswii." + m_settings.domain + "/w0") + ")\"");
+    ImGui::BeginDisabled(!domainValid() || m_task != nullptr || m_serverTesting);
+    if (ImGui::Button(m_serverTesting ? "Testing..." : "Test the server")) {
+        startServerTest();
     }
     ImGui::EndDisabled();
     if (!m_serverTest.empty()) {
-        ImGui::SameLine();
         ImGui::PushTextWrapPos(0);
-        ImGui::TextColored(m_serverTest.find("200") != std::string::npos ? colorOk : colorWarn, "%s", m_serverTest.c_str());
+        ImGui::TextColored(m_serverTestOk ? colorOk : colorWarn, "%s", m_serverTest.c_str());
         ImGui::PopTextWrapPos();
     }
 
@@ -917,9 +1140,10 @@ void App::drawKeys()
         m_page = Page::Build;
     }
 
-    if (ImGui::BeginPopupModal("Replace the key?", &m_confirmKeys, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted("A new key makes every installed stage 1 and payload invalid.");
-        ImGui::TextUnformatted("You then have to build everything again and install it on the server.");
+    ImGui::SetNextWindowSize(ImVec2(470, 210), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Replace the key?", &m_confirmKeys)) {
+        ImGui::TextWrapped("A new key makes every installed stage 1 and payload invalid.");
+        ImGui::TextWrapped("You then have to build everything again and install it on the server.");
         ImGui::Spacing();
         if (ImGui::Button("Generate a new key")) {
             startTask(TaskKind::Keys, "Generating keys", "bash ./make.sh --keys");
@@ -1120,7 +1344,10 @@ void App::drawGecko()
     ImGui::SameLine();
     ImGui::TextColored(colorMuted, "%d games", static_cast<int>(m_geckoFiles.size()));
 
-    ImGui::BeginChild("geckolist", ImVec2(260, 0), ImGuiChildFlags_Borders);
+    const ImVec2 geckoAvailable = ImGui::GetContentRegionAvail();
+    const float divider = 7.0f;
+    m_geckoWidth = std::clamp(m_geckoWidth, 165.0f, std::max(165.0f, geckoAvailable.x - 240.0f));
+    ImGui::BeginChild("geckolist", ImVec2(m_geckoWidth, geckoAvailable.y), ImGuiChildFlags_Borders);
     for (const std::string& name : m_geckoFiles) {
         if (!m_geckoFilter.empty() && name.find(m_geckoFilter) == std::string::npos) {
             continue;
@@ -1139,8 +1366,12 @@ void App::drawGecko()
         }
     }
     ImGui::EndChild();
-    ImGui::SameLine();
-    ImGui::BeginChild("geckocode", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::SameLine(0, 0);
+    ImGui::InvisibleButton("##gecko-divider", ImVec2(divider, geckoAvailable.y));
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    if (ImGui::IsItemActive()) m_geckoWidth += ImGui::GetIO().MouseDelta.x;
+    ImGui::SameLine(0, 0);
+    ImGui::BeginChild("geckocode", ImVec2(0, geckoAvailable.y), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
     if (m_geckoSelected.empty()) {
         ImGui::TextColored(colorMuted, "Choose a game on the left.");
     } else {

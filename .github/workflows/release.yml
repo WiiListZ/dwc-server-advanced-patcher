@@ -21,6 +21,7 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release || exit /b 1
           cmake --build build || exit /b 1
+          ctest --test-dir build --output-on-failure || exit /b 1
       - name: Stage
         shell: bash
         run: |
@@ -41,6 +42,7 @@ jobs:
         run: |
           cmake -S gui -B gui/build -DCMAKE_BUILD_TYPE=Release
           cmake --build gui/build -j
+          ctest --test-dir gui/build --output-on-failure
       - name: Stage
         run: |
           mkdir release
@@ -58,6 +60,7 @@ jobs:
         run: |
           cmake -S gui -B gui/build -DCMAKE_BUILD_TYPE=Release
           cmake --build gui/build -j
+          ctest --test-dir gui/build --output-on-failure
       - name: Stage
         run: |
           mkdir release
