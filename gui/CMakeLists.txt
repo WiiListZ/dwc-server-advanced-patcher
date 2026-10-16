@@ -35,6 +35,7 @@ add_executable(dwc-patcher-gui
   src/process.cpp
   src/platform.cpp
   src/source_install.cpp
+  src/update_checker.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -79,4 +80,26 @@ if(BUILD_TESTING)
     target_link_libraries(source-install-test PRIVATE Threads::Threads)
   endif()
   add_test(NAME source-install COMMAND source-install-test)
+
+  add_executable(update-checker-test
+    tests/update_checker_test.cpp
+    src/update_checker.cpp
+    src/process.cpp
+    src/platform.cpp)
+  target_include_directories(update-checker-test PRIVATE src)
+  if(MSVC)
+    target_compile_options(update-checker-test PRIVATE /utf-8)
+    target_compile_definitions(update-checker-test PRIVATE _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
+  endif()
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(update-checker-test PRIVATE Threads::Threads)
+  endif()
+  add_test(NAME update-checker COMMAND update-checker-test)
+
+  add_executable(game-titles-test tests/game_titles_test.cpp)
+  target_include_directories(game-titles-test PRIVATE src)
+  if(MSVC)
+    target_compile_options(game-titles-test PRIVATE /utf-8)
+  endif()
+  add_test(NAME game-titles COMMAND game-titles-test)
 endif()

@@ -3,6 +3,8 @@
 #include <filesystem>
 #include <string>
 
+#include "version.hpp"
+
 struct SourceInstallResult {
     bool ok = false;
     std::string message;
@@ -13,4 +15,4 @@ struct SourceInstallResult {
 // directory containing the GUI executable.
 SourceInstallResult installPatcherSource(const std::filesystem::path& target,
                                          const std::string& archiveUrl =
-                                             "https://codeload.github.com/WiiListZ/dwc-server-advanced-patcher/tar.gz/refs/tags/v1.0.3");
+                                             std::string("https://codeload.github.com/WiiListZ/dwc-server-advanced-patcher/tar.gz/refs/tags/v") + kPatcherVersion);

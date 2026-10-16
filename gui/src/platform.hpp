@@ -21,6 +21,9 @@ std::filesystem::path executableDir();
 // or the desktop's file manager.
 void openInFileManager(const std::filesystem::path& path);
 
+// Opens a trusted HTTPS release URL in the user's default browser.
+void openUrl(const std::string& url);
+
 // pickFolder shows the system folder picker. Empty when cancelled or when
 // the system has none.
 std::optional<std::filesystem::path> pickFolder(const std::string& title, const std::filesystem::path& start);

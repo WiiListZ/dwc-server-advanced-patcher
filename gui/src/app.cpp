@@ -5,6 +5,8 @@
 #endif
 
 #include "app.hpp"
+#include "game_titles.hpp"
+#include "version.hpp"
 
 #include "imgui.h"
 #include "misc/cpp/imgui_stdlib.h"
@@ -112,6 +114,42 @@ const char* regionName(char region)
     }
 }
 
+std::string_view gameTitle(const std::string& code)
+{
+    if (code.size() < 5) return {};
+    const std::string_view variant(code.data(), 5);
+    const auto it = std::lower_bound(std::begin(kGameTitles), std::end(kGameTitles), variant,
+                                     [](const auto& item, std::string_view value) { return item.first < value; });
+    return it != std::end(kGameTitles) && it->first == variant ? it->second : std::string_view{};
+}
+
+std::string asciiLower(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+std::string geckoServerDomain(const std::string& code)
+{
+    // Gecko text is pairs of 32-bit hex words. Decode them to find the NAS
+    // URL embedded in the generated patch, including builds made elsewhere.
+    std::istringstream words(code);
+    std::string word;
+    std::string bytes;
+    while (words >> word) {
+        if (word.size() != 8 || !std::all_of(word.begin(), word.end(), [](unsigned char c) { return std::isxdigit(c); })) continue;
+        const unsigned long value = std::stoul(word, nullptr, 16);
+        for (int shift : {24, 16, 8, 0}) bytes.push_back(static_cast<char>(value >> shift));
+    }
+    const size_t marker = bytes.find("://nas.");
+    if (marker == std::string::npos) return {};
+    const size_t start = marker + 7;
+    const size_t end = bytes.find('/', start);
+    if (end == std::string::npos || end - start > 200) return {};
+    return bytes.substr(start, end - start);
+}
+
 bool sameFileContent(const fs::path& a, const fs::path& b)
 {
     auto first = readFile(a);
@@ -179,15 +217,6 @@ HttpProbe probeHttp(const std::string& url)
     }
     probe.error = trim(result.error.empty() ? result.output : result.error);
     return probe;
-}
-
-bool supportsCertificateSetup(const std::string& output)
-{
-    int major = 0, minor = 0, patch = 0;
-    if (std::sscanf(output.c_str(), "dwc-server-advanced v%d.%d.%d", &major, &minor, &patch) != 3) {
-        return false;
-    }
-    return major > 1 || (major == 1 && (minor > 0 || (minor == 0 && patch >= 2)));
 }
 
 } // namespace
@@ -261,6 +290,7 @@ App::App()
     }
     refreshGecko();
     startCheck();
+    startUpdateCheck();
 }
 
 App::~App()
@@ -277,8 +307,8 @@ App::~App()
     if (m_serverTestThread.joinable()) {
         m_serverTestThread.join();
     }
-    if (m_certThread.joinable()) {
-        m_certThread.join();
+    if (m_updateThread.joinable()) {
+        m_updateThread.join();
     }
     m_settings.save(m_settingsFile);
 }
@@ -622,69 +652,34 @@ void App::pollServerTest()
     appendLog(m_serverTest);
 }
 
-void App::startCertificateSetup()
+void App::startUpdateCheck()
 {
-    if (m_certGenerating || m_task || m_settings.serverDir.empty()) {
-        return;
-    }
-    if (m_certThread.joinable()) {
-        m_certThread.join();
-    }
-    const fs::path folder = pathFromUtf8(m_settings.serverDir);
-    m_certMessage.clear();
-    m_certOk = false;
-    m_certGenerating = true;
-    m_certDone = false;
-    m_certThread = std::thread([this, folder] {
-        std::string message;
-        bool ok = false;
-        std::error_code error;
-        for (const auto& entry : fs::directory_iterator(folder, error)) {
-            if (error) break;
-            const std::string name = pathToUtf8(entry.path().filename());
-            if (name.rfind("dwc-server-advanced", 0) != 0 || !entry.is_regular_file()) continue;
-#ifdef _WIN32
-            if (entry.path().extension() != ".exe") continue;
-#elif defined(__APPLE__)
-            if (name.find("darwin") == std::string::npos) continue;
-#else
-            if (name.find("linux") == std::string::npos) continue;
-#endif
-            const std::string executable = pathToUtf8(entry.path());
-            CaptureResult version = runCapture({executable, "--version"}, folder);
-            if (version.exitCode != 0 || !supportsCertificateSetup(trim(version.output))) continue;
-            CaptureResult generated = runCapture({executable, "--dir", pathToUtf8(folder), "--generate-https"}, folder);
-            ok = generated.exitCode == 0;
-            message = trim(generated.output);
-            if (message.empty()) message = generated.error;
-            if (message.empty()) message = ok ? "HTTPS files are ready. Restart the server to load them."
-                                              : "Certificate generation failed; check the server configuration and Dolphin certificate files.";
-            if (ok) message += " Restart the server to load the certificates.";
-            break;
-        }
-        if (message.empty()) {
-            message = error ? "Cannot inspect the server folder: " + error.message()
-                            : "No dwc-server-advanced v1.0.2 or newer executable was found in this folder. Update the server first.";
-        }
-        std::lock_guard lock(m_certMutex);
-        m_certResult = std::move(message);
-        m_certResultOk = ok;
-        m_certDone = true;
+    if (m_updateChecking) return;
+    if (m_updateThread.joinable()) m_updateThread.join();
+    m_updateChecking = true;
+    m_updateDone = false;
+    m_lastUpdateCheck = std::chrono::steady_clock::now();
+    m_updateThread = std::thread([this] {
+        UpdateCheckResult result = checkForUpdates(kPatcherVersion);
+        std::lock_guard lock(m_updateMutex);
+        m_updateResult = std::move(result);
+        m_updateDone = true;
     });
 }
 
-void App::pollCertificateSetup()
+void App::pollUpdateCheck()
 {
-    if (!m_certGenerating) return;
+    if (!m_updateChecking) return;
     {
-        std::lock_guard lock(m_certMutex);
-        if (!m_certDone) return;
-        m_certMessage = m_certResult;
-        m_certOk = m_certResultOk;
+        std::lock_guard lock(m_updateMutex);
+        if (!m_updateDone) return;
+        if (m_updateResult.available && m_updateResult.release.version != m_lastNotifiedVersion) {
+            m_lastNotifiedVersion = m_updateResult.release.version;
+            m_updateNoticePending = true;
+        }
     }
-    m_certThread.join();
-    m_certGenerating = false;
-    appendLog(m_certMessage);
+    m_updateThread.join();
+    m_updateChecking = false;
 }
 
 // ----- Tasks ------------------------------------------------------------------
@@ -920,9 +915,12 @@ void App::frame()
     pollCheck();
     pollSourceInstall();
     pollServerTest();
-    pollCertificateSetup();
+    pollUpdateCheck();
     pollTask();
-    if (m_pendingAction && !m_checking && !m_task && !m_serverTesting && !m_certGenerating) {
+    if (!m_updateChecking && std::chrono::steady_clock::now() - m_lastUpdateCheck >= std::chrono::hours(6)) {
+        startUpdateCheck();
+    }
+    if (m_pendingAction && !m_checking && !m_task && !m_serverTesting) {
         m_pendingAction = false;
         if (m_page == Page::Build && buildBlocker().empty()) {
             startTask(TaskKind::Build, "Building", buildCommand());
@@ -937,6 +935,10 @@ void App::frame()
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
     ImGui::Begin("Patcher", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    if (m_updateNoticePending) {
+        ImGui::OpenPopup("Patcher update available");
+        m_updateNoticePending = false;
+    }
 
     const ImVec2 available = ImGui::GetContentRegionAvail();
     const float divider = 7.0f;
@@ -988,6 +990,19 @@ void App::frame()
         // The remaining region accounts for both ImGui item gaps, so the
         // log's lower border stays inside the application window.
         drawLog(std::max(1.0f, ImGui::GetContentRegionAvail().y));
+    }
+    ImGui::SetNextWindowSize(ImVec2(430, 0), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Patcher update available", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Version %s is available", m_updateResult.release.version.c_str());
+        ImGui::TextColored(colorMuted, "Installed: v%s", kPatcherVersion);
+        ImGui::TextWrapped("Open the release page to download the new patcher for your platform. Your patcher folder and settings stay where they are.");
+        if (primaryButton("Open release page")) {
+            openUrl(m_updateResult.release.url);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Later")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
     }
     ImGui::End();
 
@@ -1059,7 +1074,22 @@ void App::drawSidebar()
         ImGui::PopID();
     }
 
-    ImGui::SetCursorPosY(ImGui::GetWindowHeight() - ImGui::GetTextLineHeightWithSpacing() * 3.2f);
+    const float footerTop = ImGui::GetWindowHeight() - 145.0f;
+    if (ImGui::GetCursorPosY() < footerTop) ImGui::SetCursorPosY(footerTop);
+    ImGui::Separator();
+    ImGui::TextColored(colorMuted, "Patcher v%s", kPatcherVersion);
+    ImGui::BeginDisabled(m_updateChecking);
+    if (ImGui::SmallButton(m_updateChecking ? "Checking updates..." : "Check for updates")) startUpdateCheck();
+    ImGui::EndDisabled();
+    if (m_updateResult.available) {
+        ImGui::TextColored(colorWarn, "New: %s", m_updateResult.release.version.c_str());
+        if (ImGui::SmallButton("Download update")) openUrl(m_updateResult.release.url);
+    } else if (m_updateResult.ok) {
+        ImGui::TextColored(colorOk, "Up to date");
+    } else if (!m_updateChecking && !m_updateResult.error.empty()) {
+        ImGui::TextColored(colorMuted, "Update check unavailable");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m_updateResult.error.c_str());
+    }
     ImGui::Separator();
     if (m_task) {
         ImGui::TextColored(colorAccent, "%s...", m_taskTitle.c_str());
@@ -1095,7 +1125,7 @@ void App::drawRequirements()
     }
     ImGui::EndDisabled();
     statusLine(repoValid(), "Patcher folder", repoValid() ? "make.sh and gamedefs.csv found" : "",
-               "Choose a folder, then download the v1.0.3 patcher source into it. You can use the program's folder.");
+               "Choose a folder, then download this patcher's source into it. You can use the program's folder.");
     ImGui::BeginDisabled(m_sourceInstalling || m_checking || m_task != nullptr);
     if (ImGui::Button("Use program folder")) {
         m_settings.repo = pathToUtf8(executableDir());
@@ -1223,41 +1253,23 @@ void App::drawServer()
     ImGui::PushTextWrapPos(0);
     ImGui::TextColored(colorMuted, "The folder of the server with config.yml (Panel -> Server -> Files shows it). The Install step copies the build into its payload/ folder. Leave it empty if the server runs on another machine: then upload dist/ in the panel's Files tab.");
     ImGui::PopTextWrapPos();
-    ImGui::BeginDisabled(m_certGenerating);
     ImGui::SetNextItemWidth(-110);
     if (ImGui::InputText("##serverdir", &m_settings.serverDir)) {
         markDirty();
-        m_certMessage.clear();
     }
     ImGui::SameLine();
     if (ImGui::Button("Browse...##server")) {
         if (auto chosen = pickFolder("Choose the dwc-server-advanced server folder", pathFromUtf8(m_settings.serverDir))) {
             m_settings.serverDir = pathToUtf8(*chosen);
             markDirty();
-            m_certMessage.clear();
         }
     }
-    ImGui::EndDisabled();
     if (!m_settings.serverDir.empty()) {
         fs::path server = pathFromUtf8(m_settings.serverDir);
         bool hasConfig = fs::exists(server / "config.yml") || fs::exists(server / "config.yaml");
         statusLine(hasConfig, "Server folder", hasConfig ? "config.yml found" : "", "No config.yml in this folder: is it the server folder?");
     }
-    ImGui::SeparatorText("HTTPS certificates");
-    ImGui::PushTextWrapPos(0);
-    ImGui::TextColored(colorMuted, "The server v1.0.2+ creates missing HTTPS files using its config.yml. Wii and DS exploit certificates need Dolphin's clientca.pem and clientcakey.pem on this computer. Existing keys are preserved.");
-    ImGui::PopTextWrapPos();
-    const fs::path serverFolder = pathFromUtf8(m_settings.serverDir);
-    const bool hasServerConfig = !m_settings.serverDir.empty() &&
-        (fs::exists(serverFolder / "config.yml") || fs::exists(serverFolder / "config.yaml"));
-    if (primaryButton(m_certGenerating ? "Generating..." : "Create HTTPS certificates", hasServerConfig && !m_certGenerating && m_task == nullptr)) {
-        startCertificateSetup();
-    }
-    if (!m_certMessage.empty()) {
-        ImGui::PushTextWrapPos(0);
-        ImGui::TextColored(m_certOk ? colorOk : colorWarn, "%s", m_certMessage.c_str());
-        ImGui::PopTextWrapPos();
-    }
+    ImGui::TextColored(colorMuted, "HTTPS certificates are generated by the server. Open Panel > Server > Settings > HTTPS to create missing files.");
     ImGui::Spacing();
     if (primaryButton("Next: signing key", domainValid())) {
         m_page = Page::Keys;
@@ -1491,43 +1503,42 @@ void App::drawInstall()
 
 void App::drawGecko()
 {
-    heading("Gecko codes", "Players apply the Gecko code for their game and region (USB loader, Riivolution or Dolphin's cheat manager). Mario Kart Wii players who reach the server through DNS are patched automatically.");
+    heading("Gecko codes", "Choose the game and region that match your copy. In Dolphin, open the game's Properties > Gecko Codes > Add New Code, then paste the code below.");
 
     if (m_geckoFiles.empty()) {
         ImGui::TextColored(colorWarn, "No Gecko codes yet: build with \"Gecko codes (stage 0)\" enabled.");
         return;
     }
 
-    ImGui::SetNextItemWidth(260);
-    ImGui::InputTextWithHint("##geckofilter", "Search, e.g. RMCP", &m_geckoFilter, ImGuiInputTextFlags_CharsUppercase);
+    ImGui::SetNextItemWidth(std::min(360.0f, ImGui::GetContentRegionAvail().x * 0.55f));
+    ImGui::InputTextWithHint("##geckofilter", "Search game title, ID or region...", &m_geckoFilter);
     ImGui::SameLine();
     if (ImGui::Button("Open folder")) {
         openInFileManager(repoPath() / "patch" / "build");
     }
     ImGui::SameLine();
-    ImGui::TextColored(colorMuted, "%d games", static_cast<int>(m_geckoFiles.size()));
+    ImGui::TextColored(colorMuted, "%d codes", static_cast<int>(m_geckoFiles.size()));
 
     const ImVec2 geckoAvailable = ImGui::GetContentRegionAvail();
     const float divider = 7.0f;
     m_geckoWidth = std::clamp(m_geckoWidth, 165.0f, std::max(165.0f, geckoAvailable.x - 240.0f));
     ImGui::BeginChild("geckolist", ImVec2(m_geckoWidth, geckoAvailable.y), ImGuiChildFlags_Borders);
+    int shown = 0;
+    const std::string filter = asciiLower(m_geckoFilter);
     for (const std::string& name : m_geckoFiles) {
-        if (!m_geckoFilter.empty() && name.find(m_geckoFilter) == std::string::npos) {
+        const std::string title(gameTitle(name));
+        const std::string region = name.size() >= 4 ? regionName(name[3]) : "";
+        if (!filter.empty() && asciiLower(title + " " + name + " " + region).find(filter) == std::string::npos) {
             continue;
         }
-        std::string label = name;
-        if (name.size() >= 4) {
-            const char* region = regionName(name[3]);
-            if (*region) {
-                label += "   ";
-                label += region;
-            }
-        }
+        ++shown;
+        const std::string label = (title.empty() ? "Unknown game" : title) + "\n" + region + "  |  " + name + "##" + name;
         if (ImGui::Selectable(label.c_str(), m_geckoSelected == name)) {
             m_geckoSelected = name;
             m_geckoContent = readFile(repoPath() / "patch" / "build" / pathFromUtf8(name + ".txt")).value_or("");
         }
     }
+    if (shown == 0) ImGui::TextColored(colorMuted, "No matching games.");
     ImGui::EndChild();
     ImGui::SameLine(0, 0);
     ImGui::InvisibleButton("##gecko-divider", ImVec2(divider, geckoAvailable.y));
@@ -1541,16 +1552,32 @@ void App::drawGecko()
         if (m_boldFont) {
             ImGui::PushFont(m_boldFont);
         }
-        ImGui::TextUnformatted(m_geckoSelected.c_str());
+        const std::string title(gameTitle(m_geckoSelected));
+        ImGui::TextUnformatted(title.empty() ? "Unknown game" : title.c_str());
         if (m_boldFont) {
             ImGui::PopFont();
         }
-        ImGui::SameLine();
-        if (primaryButton("Copy")) {
+        ImGui::TextColored(colorMuted, "%s  |  %s", m_geckoSelected.c_str(),
+                           m_geckoSelected.size() >= 4 ? regionName(m_geckoSelected[3]) : "");
+        const std::string builtDomain = geckoServerDomain(m_geckoContent);
+        if (!builtDomain.empty()) {
+            ImGui::TextColored(colorMuted, "This code connects to nas.%s/w1", builtDomain.c_str());
+            if (!m_settings.domain.empty() && asciiLower(builtDomain) != asciiLower(m_settings.domain)) {
+                ImGui::PushTextWrapPos(0);
+                ImGui::TextColored(colorWarn, "Server page uses %s. Rebuild the Gecko codes for that domain, reinstall the build, and replace the old code in your game.", m_settings.domain.c_str());
+                ImGui::PopTextWrapPos();
+            }
+        }
+        if (primaryButton("Copy Gecko code")) {
             ImGui::SetClipboardText(m_geckoContent.c_str());
+            m_geckoCopiedAt = std::chrono::steady_clock::now();
         }
         ImGui::SameLine();
-        ImGui::TextColored(colorMuted, "patch/build/%s.txt", m_geckoSelected.c_str());
+        if (std::chrono::steady_clock::now() - m_geckoCopiedAt < std::chrono::seconds(3)) {
+            ImGui::TextColored(colorOk, "Copied to clipboard");
+        } else {
+            ImGui::TextColored(colorMuted, "Paste into your cheat manager's code field");
+        }
         if (m_monoFont) {
             ImGui::PushFont(m_monoFont);
         }

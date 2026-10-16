@@ -78,6 +78,12 @@ void openInFileManager(const fs::path& path)
     ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+void openUrl(const std::string& url)
+{
+    const std::wstring wideUrl = widen(url);
+    ShellExecuteW(nullptr, L"open", wideUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 std::optional<fs::path> pickFolder(const std::string& title, const fs::path& start)
 {
     std::optional<fs::path> result;
@@ -202,6 +208,16 @@ void openInFileManager(const fs::path& path)
     std::string command = "open " + shellQuote(target.string()) + " &";
 #  else
     std::string command = "xdg-open " + shellQuote(target.string()) + " >/dev/null 2>&1 &";
+#  endif
+    [[maybe_unused]] int ignored = std::system(command.c_str());
+}
+
+void openUrl(const std::string& url)
+{
+#  ifdef __APPLE__
+    const std::string command = "open " + shellQuote(url) + " &";
+#  else
+    const std::string command = "xdg-open " + shellQuote(url) + " >/dev/null 2>&1 &";
 #  endif
     [[maybe_unused]] int ignored = std::system(command.c_str());
 }
