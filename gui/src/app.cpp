@@ -514,19 +514,28 @@ void App::startServerTest()
                 } else {
                     message += "/w0 returned HTTP " + stage.status + ". ";
                 }
-                const HttpProbe name = probeHttp("http://nas.localhost/w0");
+                const HttpProbe stageV1 = probeHttp("http://127.0.0.1/w1");
+                if (stageV1.status == "404") {
+                    message += "/w1 is missing: install stage1v1.bin. ";
+                }
+                const HttpProbe name = probeHttp("http://nas.localhost/w1");
                 if (name.exitCode == 6) {
-                    message += "nas.localhost does not resolve. Use a local DNS name that points to this computer.";
+                    message += "nas.localhost does not resolve. Map nas.localhost and gs.localhost to 127.0.0.1 in the Windows hosts file.";
                 } else if (name.exitCode != 0) {
                     message += "nas.localhost cannot reach the server: " + name.error;
                 } else {
                     message += "nas.localhost resolves (HTTP " + name.status + ").";
-                    ok = name.status == "200";
+                    ok = name.status == "200" && stage.status == "200" && stageV1.status == "200";
+                    const HttpProbe gamespyName = probeHttp("http://gs.localhost/");
+                    if (gamespyName.exitCode == 6) {
+                        message += " gs.localhost does not resolve; add it to the Windows hosts file.";
+                        ok = false;
+                    }
                 }
             }
         } else {
             const std::string host = "nas." + domain;
-            const HttpProbe response = probeHttp("http://" + host + "/w0");
+            const HttpProbe response = probeHttp("http://" + host + "/w1");
             if (response.exitCode == 6) {
                 message = host + " does not resolve. Point it to the server IP in DNS.";
             } else if (response.exitCode == 7) {
@@ -534,10 +543,11 @@ void App::startServerTest()
             } else if (response.exitCode != 0) {
                 message = "Cannot reach " + host + ": " + response.error;
             } else if (response.status == "200") {
-                message = host + " serves stage 1 (HTTP 200).";
-                ok = true;
+                const HttpProbe stageV0 = probeHttp("http://" + host + "/w0");
+                message = host + " serves /w1 (HTTP 200). /w0 returned HTTP " + stageV0.status + ".";
+                ok = stageV0.status == "200";
             } else if (response.status == "404") {
-                message = host + " reaches the server, but /w0 is missing. Build and install stage1.bin.";
+                message = host + " reaches the server, but /w1 is missing. Install stage1v1.bin.";
             } else {
                 message = host + " returned HTTP " + response.status + ".";
             }
@@ -796,6 +806,16 @@ bool App::install(std::string& message)
         }
         ++copied;
     }
+    // Gecko patches request /w1; the build currently emits one stage 1 binary.
+    // Preserve an explicitly built v1 file if a future patcher supplies one.
+    if (!fs::exists(dist / "stage1v1.bin")) {
+        fs::copy_file(dist / "stage1.bin", payload / "stage1v1.bin", fs::copy_options::overwrite_existing, error);
+        if (error) {
+            message = "Cannot install stage1v1.bin: " + error.message();
+            return false;
+        }
+        ++copied;
+    }
     int exploits = 0;
     for (const auto& entry : fs::directory_iterator(repo / "exploit" / "sbcm", error)) {
         if (entry.path().extension() != ".bin") {
@@ -1030,7 +1050,7 @@ void App::drawRequirements()
     }
     ImGui::EndDisabled();
     statusLine(repoValid(), "Patcher folder", repoValid() ? "make.sh and gamedefs.csv found" : "",
-               "Choose a folder, then download the v1.0.1 patcher source into it. You can use the program's folder.");
+               "Choose a folder, then download the v1.0.2 patcher source into it. You can use the program's folder.");
     ImGui::BeginDisabled(m_sourceInstalling || m_checking || m_task != nullptr);
     if (ImGui::Button("Use program folder")) {
         m_settings.repo = pathToUtf8(executableDir());
@@ -1134,7 +1154,7 @@ void App::drawServer()
         ImGui::TextColored(colorMuted, "Games will connect to nas.%s, gpcm.gs.%s and other hostnames.",
                            m_settings.domain.c_str(), m_settings.domain.c_str());
         if (m_settings.domain == "localhost") {
-            ImGui::TextColored(colorWarn, "localhost only refers to this computer. The game also needs nas.localhost to resolve.");
+            ImGui::TextColored(colorWarn, "localhost only refers to this computer. The game also needs nas.localhost and gs.localhost to resolve.");
         } else if (std::all_of(m_settings.domain.begin(), m_settings.domain.end(), [](unsigned char c) {
                        return std::isdigit(c) || c == '.';
                    })) {

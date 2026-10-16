@@ -82,18 +82,18 @@ git merge upstream/main
 
 | Step | What it does |
 |---|---|
-| **1 Requirements** | Creates the patcher folder by downloading the v1.0.1 source archive into the chosen folder, including the GUI's own folder if selected. Existing files are preserved. Checks the shell, devkitPPC, Python 3.11+ with `cryptography` and curl, and says how to install what is missing. Finds `make.sh` checked out with Windows line endings and fixes it. |
-| **2 Server** | The domain built into the patch, a test that `nas.<domain>/w0` answers, the server folder (the one with `config.yml`), and a button to create HTTPS certificates with dwc-server-advanced v1.0.2 or newer. |
+| **1 Requirements** | Creates the patcher folder by downloading the v1.0.2 source archive into the chosen folder, including the GUI's own folder if selected. Existing files are preserved. Checks the shell, devkitPPC, Python 3.11+ with `cryptography` and curl, and says how to install what is missing. Finds `make.sh` checked out with Windows line endings and fixes it. |
+| **2 Server** | The domain built into the patch, a test that `nas.<domain>/w0` and `/w1` answer, the server folder (the one with `config.yml`), and a button to create HTTPS certificates with dwc-server-advanced v1.0.2 or newer. |
 | **3 Signing key** | Shows whether the key pair exists and matches the build, and generates a new one after a warning. |
 | **4 Build** | Choose payloads, stage 1, Gecko codes and the SBCM exploit, the number of jobs and an optional game filter (`RMC`, `RMCP`, …). Shows the exact `make.sh` command, its output, and can cancel. |
-| **5 Install** | Copies `dist/` into the server's `payload/` and `exploit/sbcm/*.bin` into `payload/sbcm/`. For a server on another machine, upload `dist/` in its panel (**Server → Files**). |
+| **5 Install** | Copies `dist/` into the server's `payload/`, creates `payload/stage1v1.bin` for Gecko patches that request `/w1`, and copies `exploit/sbcm/*.bin` into `payload/sbcm/`. For a server on another machine, upload these files in its panel (**Server → Files**). |
 | **6 Gecko codes** | Lists the generated codes by game and region, with search and **Copy**. |
 
-To set up a release binary without cloning the repository, open **Requirements** and click **Download patcher here**. The default destination is a `dwc-server-advanced-patcher` folder beside the program. You can type another path, use **Browse...**, or click **Use program folder** to put the source alongside the executable. The GUI downloads the v1.0.1 source archive using `curl` and extracts it using `tar`; both tools must be available on the machine. It accepts an existing folder containing unrelated files, but stops if a patcher source file would be overwritten. If you already cloned the repository, select that folder and continue without downloading.
+To set up a release binary without cloning the repository, open **Requirements** and click **Download patcher here**. The default destination is a `dwc-server-advanced-patcher` folder beside the program. You can type another path, use **Browse...**, or click **Use program folder** to put the source alongside the executable. The GUI downloads the v1.0.2 source archive using `curl` and extracts it using `tar`; both tools must be available on the machine. It accepts an existing folder containing unrelated files, but stops if a patcher source file would be overwritten. If you already cloned the repository, select that folder and continue without downloading.
 
 The application window can be resized. Drag the dividers beside the navigation menu and Gecko code list, or above the task output, to give each panel more room. The signing-key confirmation window can also be resized.
 
-For a server on the same PC, `localhost` by itself is not enough: the patch connects to names such as `nas.localhost`, and those names must resolve. A bare IP also becomes a prefixed name (`nas.<IP>`). For a LAN server, use a local DNS name such as `wfc.home.arpa` and map `nas.wfc.home.arpa`, `gpcm.gs.wfc.home.arpa`, and the other hostnames to the server's LAN IP. The **Test the server** button now reports separately whether the host name resolves, port 80 answers, and `/w0` has been installed. A missing `/w0` before **Build** and **Install** does not mean the server is down. See the server's [local setup guide](https://github.com/WiiListZ/dwc-server-advanced/blob/main/docs/LOCAL_SETUP.md) for Dolphin and [hostname list](https://github.com/WiiListZ/dwc-server-advanced/blob/main/docs/HOSTNAMES.md) for DNS overrides.
+For a server on the same PC, `localhost` by itself is not enough: the patch connects to names such as `nas.localhost` and `gs.localhost`. Windows may not resolve them until they are mapped to `127.0.0.1` in the hosts file. A bare IP also becomes a prefixed name (`nas.<IP>`). For a LAN server, use a local DNS name such as `wfc.home.arpa` and map `nas.wfc.home.arpa`, `gpcm.gs.wfc.home.arpa`, and the other hostnames to the server's LAN IP. The **Test the server** button checks name resolution, port 80, `/w0` and `/w1`. The Gecko patch requests `/w1`; the GUI Install step creates its file. See the server's [local setup guide](https://github.com/WiiListZ/dwc-server-advanced/blob/main/docs/LOCAL_SETUP.md) for the Windows hosts entries and [hostname list](https://github.com/WiiListZ/dwc-server-advanced/blob/main/docs/HOSTNAMES.md) for DNS overrides.
 
 On **Server**, select the local dwc-server-advanced folder with `config.yml` and its v1.0.2 or newer executable, then click **Create HTTPS certificates**. The button runs the server's `--generate-https` command. It creates missing `fullchain.pem` and `privkey.pem`, plus Wii and DS certificate sets if those modes are enabled in `config.yml` and Dolphin's `clientca.pem` and `clientcakey.pem` are available. The server also does this automatically when HTTPS starts. Existing files are preserved. The normal certificate is self-signed for local testing; use a trusted certificate for a public domain. See the server's [HTTPS certificate guide](https://github.com/WiiListZ/dwc-server-advanced/blob/main/docs/HTTPS_CERTIFICATES.md). Restart the server after using the button.
 
@@ -191,6 +191,7 @@ Keep the same key between builds. With a new key, every stage 1 and payload must
    SERVER_DATA=/var/lib/dwc-server-advanced
    mkdir -p "$SERVER_DATA/payload/sbcm"
    cp -r dist/. "$SERVER_DATA/payload/"
+   cp dist/stage1.bin "$SERVER_DATA/payload/stage1v1.bin"  # Gecko patches request /w1
    cp exploit/sbcm/*.bin "$SERVER_DATA/payload/sbcm/"   # Mario Kart Wii only
    ```
 
@@ -200,6 +201,7 @@ Keep the same key between builds. With a new key, every stage 1 and payload must
    payload/
      private-key.pem
      stage1.bin
+     stage1v1.bin
      binary/payload.<game>.bin
      sbcm/payload.RMC*.bin
    ```
@@ -213,7 +215,7 @@ Keep the same key between builds. With a new key, every stage 1 and payload must
    allowNoSSLCheatClients: false   # true only for local Dolphin tests with NoSSL codes
    ```
 
-   Set `payloadServerAddress` only if another service answers `/payload`. The server still serves `/w0` and `/w1` from `payload/stage1.bin`.
+   Set `payloadServerAddress` only if another service answers `/payload`. The server reads `/w0` from `payload/stage1.bin` and `/w1` from `payload/stage1v1.bin`.
 
 4. **Give players the patch.** They can use the Gecko code for their game from `patch/build/` (with a USB loader, Riivolution or Dolphin's cheat manager). They can also use a disc or the launcher built from it. Mario Kart Wii players who already reach your server through DNS get patched during matchmaking by the SBCM exploit.
 
@@ -224,7 +226,8 @@ The server's [docs/PAYLOADS.md](https://github.com/WiiListZ/dwc-server-advanced/
 ## Checking that it works
 
 ```sh
-curl -I http://naswii.wfc.example.com/w0     # 200 means stage 1 is served
+curl -I http://nas.wfc.example.com/w1         # 200 means Gecko stage 1 is served
+curl -I http://nas.wfc.example.com/w0         # 200 means SBCM stage 1 is served
 ```
 
 Then connect with a patched game. In the dwc-server-advanced panel, **Live** lists the player, and for Mario Kart Wii it marks patched clients with **Payload**. The player's profile says *Payload features active*. If the game shows an error code instead, look it up on the server's `/errors` page.
