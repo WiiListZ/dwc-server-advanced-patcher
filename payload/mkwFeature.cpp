@@ -18,7 +18,7 @@ u32 NetSelectHandler::s_kickTimerFrames = 0;
 namespace wwfc::mkw::UI
 {
 
-const wchar_t* WifiMenuPage::s_messageOfTheDay = L"Welcome!";
+const wchar_t* WifiMenuPage::s_messageOfTheDay = nullptr;
 wchar_t        WifiMenuPage::s_messageOfTheDayBuffer[256] = {};
 bool           WifiMenuPage::s_hasSeenMessageOfTheDay     = false;
 
@@ -35,6 +35,8 @@ static GameSpy::GPResult GetMessageOfTheDay(GameSpy::GPResult gpResult, const ch
     if (std::strncmp(message, loginChallenge2Message, sizeof(loginChallenge2Message) - 1)) {
         return gpResult;
     }
+
+    WifiMenuPage::ClearMessageOfTheDay();
 
     const char motdKey[] = "\\wl:motd\\";
     char       value[512];

@@ -14,7 +14,7 @@ class WifiMenuPage : public Page
 public:
     void showMessageOfTheDay()
     {
-        if (s_hasSeenMessageOfTheDay) {
+        if (s_hasSeenMessageOfTheDay || !s_messageOfTheDay || !s_messageOfTheDay[0]) {
             return;
         }
 
@@ -25,6 +25,12 @@ public:
     static void SetMessageOfTheDay(wchar_t* messageOfTheDay)
     {
         s_messageOfTheDay = messageOfTheDay;
+        s_hasSeenMessageOfTheDay = false;
+    }
+
+    static void ClearMessageOfTheDay()
+    {
+        s_messageOfTheDay        = nullptr;
         s_hasSeenMessageOfTheDay = false;
     }
 
