@@ -13,4 +13,4 @@ struct SourceInstallResult {
 // directory containing the GUI executable.
 SourceInstallResult installPatcherSource(const std::filesystem::path& target,
                                          const std::string& archiveUrl =
-                                             "https://codeload.github.com/WiiListZ/dwc-server-advanced-patcher/tar.gz/refs/tags/v1.0.2");
+                                             "https://codeload.github.com/WiiListZ/dwc-server-advanced-patcher/tar.gz/refs/tags/v1.0.3");

@@ -1,3 +1,9 @@
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include "app.hpp"
 
 #include "imgui.h"
@@ -8,6 +14,13 @@
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <netdb.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -111,6 +124,41 @@ struct HttpProbe {
     std::string status;
     std::string error;
 };
+
+bool systemResolvesIPv4(const std::string& host)
+{
+#ifdef _WIN32
+    WSADATA winsock{};
+    if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return false;
+#endif
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    addrinfo* addresses = nullptr;
+    const bool resolved = getaddrinfo(host.c_str(), nullptr, &hints, &addresses) == 0;
+    if (addresses != nullptr) freeaddrinfo(addresses);
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    return resolved;
+}
+
+std::string firstUnresolvedGameHost(const std::string& domain)
+{
+    constexpr const char* prefixes[] = {
+        "nas.", "naswii.", "gs.", "gpcm.gs.", "gpsp.gs.",
+        "gamestats.gs.", "gamestats2.gs.",
+        "mariokartwii.available.gs.", "mariokartwii.master.gs.",
+        "mariokartwii.ms19.gs.", "mariokartwii.gamestats.gs.",
+        "mariokartwii.gamestats2.gs.", "mariokartwii.sake.gs.",
+        "mariokartwii.natneg1.gs.", "mariokartwii.natneg2.gs.",
+        "mariokartwii.natneg3.gs."
+    };
+    for (const char* prefix : prefixes) {
+        const std::string host = std::string(prefix) + domain;
+        if (!systemResolvesIPv4(host)) return host;
+    }
+    return {};
+}
 
 HttpProbe probeHttp(const std::string& url)
 {
@@ -518,38 +566,35 @@ void App::startServerTest()
                 if (stageV1.status == "404") {
                     message += "/w1 is missing: install stage1v1.bin. ";
                 }
-                const HttpProbe name = probeHttp("http://nas.localhost/w1");
-                if (name.exitCode == 6) {
-                    message += "nas.localhost does not resolve. Map nas.localhost and gs.localhost to 127.0.0.1 in the Windows hosts file.";
-                } else if (name.exitCode != 0) {
-                    message += "nas.localhost cannot reach the server: " + name.error;
+                const std::string missingHost = firstUnresolvedGameHost(domain);
+                if (!missingHost.empty()) {
+                    message += "The operating system cannot resolve " + missingHost + ". Map all game hostnames to 127.0.0.1 in the hosts file; curl alone can give a false positive.";
                 } else {
-                    message += "nas.localhost resolves (HTTP " + name.status + ").";
-                    ok = name.status == "200" && stage.status == "200" && stageV1.status == "200";
-                    const HttpProbe gamespyName = probeHttp("http://gs.localhost/");
-                    if (gamespyName.exitCode == 6) {
-                        message += " gs.localhost does not resolve; add it to the Windows hosts file.";
-                        ok = false;
-                    }
+                    const HttpProbe name = probeHttp("http://nas.localhost/w1");
+                    message += "nas.localhost resolves through Windows (HTTP " + name.status + ").";
+                    ok = name.exitCode == 0 && name.status == "200" && stage.status == "200" && stageV1.status == "200";
                 }
             }
         } else {
             const std::string host = "nas." + domain;
-            const HttpProbe response = probeHttp("http://" + host + "/w1");
-            if (response.exitCode == 6) {
-                message = host + " does not resolve. Point it to the server IP in DNS.";
-            } else if (response.exitCode == 7) {
-                message = host + " resolves, but port 80 refuses the connection. Check the server address and firewall.";
-            } else if (response.exitCode != 0) {
-                message = "Cannot reach " + host + ": " + response.error;
-            } else if (response.status == "200") {
-                const HttpProbe stageV0 = probeHttp("http://" + host + "/w0");
-                message = host + " serves /w1 (HTTP 200). /w0 returned HTTP " + stageV0.status + ".";
-                ok = stageV0.status == "200";
-            } else if (response.status == "404") {
-                message = host + " reaches the server, but /w1 is missing. Install stage1v1.bin.";
+            const std::string missingHost = firstUnresolvedGameHost(domain);
+            if (!missingHost.empty()) {
+                message = missingHost + " does not resolve through the operating system. Point all game hostnames to the server IP.";
             } else {
-                message = host + " returned HTTP " + response.status + ".";
+                const HttpProbe response = probeHttp("http://" + host + "/w1");
+                if (response.exitCode == 7) {
+                    message = host + " resolves, but port 80 refuses the connection. Check the server address and firewall.";
+                } else if (response.exitCode != 0) {
+                    message = "Cannot reach " + host + ": " + response.error;
+                } else if (response.status == "200") {
+                    const HttpProbe stageV0 = probeHttp("http://" + host + "/w0");
+                    message = host + " serves /w1 (HTTP 200). /w0 returned HTTP " + stageV0.status + ".";
+                    ok = stageV0.status == "200";
+                } else if (response.status == "404") {
+                    message = host + " reaches the server, but /w1 is missing. Install stage1v1.bin.";
+                } else {
+                    message = host + " returned HTTP " + response.status + ".";
+                }
             }
         }
         std::lock_guard lock(m_serverTestMutex);
@@ -1050,7 +1095,7 @@ void App::drawRequirements()
     }
     ImGui::EndDisabled();
     statusLine(repoValid(), "Patcher folder", repoValid() ? "make.sh and gamedefs.csv found" : "",
-               "Choose a folder, then download the v1.0.2 patcher source into it. You can use the program's folder.");
+               "Choose a folder, then download the v1.0.3 patcher source into it. You can use the program's folder.");
     ImGui::BeginDisabled(m_sourceInstalling || m_checking || m_task != nullptr);
     if (ImGui::Button("Use program folder")) {
         m_settings.repo = pathToUtf8(executableDir());

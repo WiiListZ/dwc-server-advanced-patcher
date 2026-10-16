@@ -46,6 +46,7 @@ target_include_directories(dwc-patcher-gui PRIVATE src ${imgui_SOURCE_DIR})
 target_link_libraries(dwc-patcher-gui PRIVATE glfw OpenGL::GL)
 
 if(WIN32)
+  target_link_libraries(dwc-patcher-gui PRIVATE ws2_32)
   enable_language(RC)
   target_sources(dwc-patcher-gui PRIVATE assets/logo.rc)
   # A window application: no console window next to the GUI.
