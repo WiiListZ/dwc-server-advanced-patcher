@@ -124,6 +124,8 @@ private:
     bool domainValid() const;
     std::string buildCommand() const;
     std::string buildBlocker() const;
+    bool buildNeedsClean() const;
+    std::string buildDomainProblem() const;
     bool makeScriptHasCRLF() const;
     void fixMakeScript();
     void findRepo();

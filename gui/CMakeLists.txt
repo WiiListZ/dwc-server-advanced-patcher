@@ -32,6 +32,7 @@ find_package(OpenGL REQUIRED)
 add_executable(dwc-patcher-gui
   src/main.cpp
   src/app.cpp
+  src/build_domain.cpp
   src/process.cpp
   src/platform.cpp
   src/source_install.cpp
@@ -102,4 +103,8 @@ if(BUILD_TESTING)
     target_compile_options(game-titles-test PRIVATE /utf-8)
   endif()
   add_test(NAME game-titles COMMAND game-titles-test)
+
+  add_executable(build-domain-test tests/build_domain_test.cpp src/build_domain.cpp)
+  target_include_directories(build-domain-test PRIVATE src)
+  add_test(NAME build-domain COMMAND build-domain-test)
 endif()

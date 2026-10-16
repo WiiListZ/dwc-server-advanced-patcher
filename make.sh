@@ -167,6 +167,12 @@ if $keys || ( (! check_keys) && $try_make_keys); then
     cp "$MISC_DIR/private-key-OUT.pem" "$DIST_DIR/private-key.pem"
 fi
 
+if [ -e "$MISC_DIR/private-key-OUT.pem" ]; then
+    # --clean removes dist/, but the existing signing key must survive a
+    # rebuild for another domain so stage 1 and server keep the same key.
+    cp "$MISC_DIR/private-key-OUT.pem" "$DIST_DIR/private-key.pem"
+fi
+
 if $payload || $stage1 || $patch; then
     if ! check_keys; then
         echo "$SCRIPT_DIR/misc/private-key-OUT.pem not found! Please generate keys using '--keys' before attempting to build anything else"

@@ -5,6 +5,7 @@
 #endif
 
 #include "app.hpp"
+#include "build_domain.hpp"
 #include "game_titles.hpp"
 #include "version.hpp"
 
@@ -128,26 +129,6 @@ std::string asciiLower(std::string value)
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
-}
-
-std::string geckoServerDomain(const std::string& code)
-{
-    // Gecko text is pairs of 32-bit hex words. Decode them to find the NAS
-    // URL embedded in the generated patch, including builds made elsewhere.
-    std::istringstream words(code);
-    std::string word;
-    std::string bytes;
-    while (words >> word) {
-        if (word.size() != 8 || !std::all_of(word.begin(), word.end(), [](unsigned char c) { return std::isxdigit(c); })) continue;
-        const unsigned long value = std::stoul(word, nullptr, 16);
-        for (int shift : {24, 16, 8, 0}) bytes.push_back(static_cast<char>(value >> shift));
-    }
-    const size_t marker = bytes.find("://nas.");
-    if (marker == std::string::npos) return {};
-    const size_t start = marker + 7;
-    const size_t end = bytes.find('/', start);
-    if (end == std::string::npos || end - start > 200) return {};
-    return bytes.substr(start, end - start);
 }
 
 bool sameFileContent(const fs::path& a, const fs::path& b)
@@ -714,6 +695,8 @@ bool App::startTask(TaskKind kind, const std::string& title, const std::string& 
     m_taskTitle = title;
     m_taskStart = std::chrono::steady_clock::now();
     m_serverTest.clear();
+    m_installOk = false;
+    m_installMessage.clear();
     return true;
 }
 
@@ -793,6 +776,8 @@ void App::refreshGecko()
 {
     m_geckoFiles.clear();
     if (!repoValid()) {
+        m_geckoSelected.clear();
+        m_geckoContent.clear();
         return;
     }
     std::error_code error;
@@ -802,6 +787,14 @@ void App::refreshGecko()
         }
     }
     std::sort(m_geckoFiles.begin(), m_geckoFiles.end());
+    if (!m_geckoSelected.empty()) {
+        if (std::binary_search(m_geckoFiles.begin(), m_geckoFiles.end(), m_geckoSelected)) {
+            m_geckoContent = readFile(repoPath() / "patch" / "build" / pathFromUtf8(m_geckoSelected + ".txt")).value_or("");
+        } else {
+            m_geckoSelected.clear();
+            m_geckoContent.clear();
+        }
+    }
 }
 
 // install copies the build into the server's payload folder, as described in
@@ -810,6 +803,10 @@ bool App::install(std::string& message)
 {
     if (!repoValid()) {
         message = "Choose the patcher folder first.";
+        return false;
+    }
+    if (!domainValid()) {
+        message = "Set a valid server domain before installing.";
         return false;
     }
     fs::path server = pathFromUtf8(m_settings.serverDir);
@@ -822,6 +819,17 @@ bool App::install(std::string& message)
     if (!fs::exists(dist / "stage1.bin") || !fs::exists(dist / "private-key.pem")) {
         message = "dist/ is incomplete: build stage 1 and the payloads first.";
         return false;
+    }
+    if (const std::string problem = buildDomainProblem(); !problem.empty()) {
+        message = problem + " Run Build again before installing.";
+        return false;
+    }
+    for (const std::string& name : m_geckoFiles) {
+        const auto code = readFile(repo / "patch" / "build" / pathFromUtf8(name + ".txt"));
+        if (!code || asciiLower(geckoServerDomain(*code)) != asciiLower(m_settings.domain)) {
+            message = "Gecko code " + name + " is missing or uses another domain. Rebuild all Gecko codes before installing.";
+            return false;
+        }
     }
 
     fs::path payload = server / "payload";
@@ -1220,6 +1228,8 @@ void App::drawServer()
     if (ImGui::InputTextWithHint("##domain", "wfc.example.com", &m_settings.domain, ImGuiInputTextFlags_CharsNoBlank)) {
         markDirty();
         m_serverTest.clear();
+        m_installOk = false;
+        m_installMessage.clear();
     }
     ImGui::EndDisabled();
     if (!m_settings.domain.empty() && !domainValid()) {
@@ -1230,6 +1240,15 @@ void App::drawServer()
                            m_settings.domain.c_str(), m_settings.domain.c_str());
         if (m_settings.domain == "localhost") {
             ImGui::TextColored(colorWarn, "localhost only refers to this computer. The game also needs nas.localhost and gs.localhost to resolve.");
+            if (ImGui::Button("Copy local hosts entries")) {
+                ImGui::SetClipboardText(
+                    "127.0.0.1 nas.localhost naswii.localhost gs.localhost\n"
+                    "127.0.0.1 gpcm.gs.localhost gpsp.gs.localhost gamestats.gs.localhost gamestats2.gs.localhost\n"
+                    "127.0.0.1 mariokartwii.available.gs.localhost mariokartwii.master.gs.localhost mariokartwii.ms19.gs.localhost\n"
+                    "127.0.0.1 mariokartwii.gamestats.gs.localhost mariokartwii.gamestats2.gs.localhost mariokartwii.sake.gs.localhost\n"
+                    "127.0.0.1 mariokartwii.natneg1.gs.localhost mariokartwii.natneg2.gs.localhost mariokartwii.natneg3.gs.localhost\n");
+            }
+            ImGui::TextColored(colorMuted, "Paste into the system hosts file with administrator rights, then test the server.");
         } else if (std::all_of(m_settings.domain.begin(), m_settings.domain.end(), [](unsigned char c) {
                        return std::isdigit(c) || c == '.';
                    })) {
@@ -1339,7 +1358,7 @@ void App::drawKeys()
 std::string App::buildCommand() const
 {
     std::string command = "bash ./make.sh";
-    if (m_settings.clean) command += " --clean";
+    if (m_settings.clean || buildNeedsClean()) command += " --clean";
     if (!keyStatus().privateKey) command += " --keys";
     if (m_settings.buildPayload) command += " --payload";
     if (m_settings.buildStage1) command += " --stage1";
@@ -1352,12 +1371,43 @@ std::string App::buildCommand() const
     return command;
 }
 
+std::string App::buildDomainProblem() const
+{
+    if (!repoValid() || !domainValid()) return {};
+    const fs::path stage1 = repoPath() / "dist" / "stage1.bin";
+    if (fs::exists(stage1)) {
+        const auto binary = readFile(stage1);
+        const std::string built = binary ? stage1ServerDomain(*binary) : "";
+        if (asciiLower(built) != asciiLower(m_settings.domain)) {
+            return "Stage 1 uses " + (built.empty() ? std::string("an unknown domain") : built) +
+                   ", but Server is set to " + m_settings.domain + ".";
+        }
+    }
+    if (!m_geckoFiles.empty()) {
+        const auto code = readFile(repoPath() / "patch" / "build" / pathFromUtf8(m_geckoFiles.front() + ".txt"));
+        const std::string built = code ? geckoServerDomain(*code) : "";
+        if (asciiLower(built) != asciiLower(m_settings.domain)) {
+            return "Gecko codes use " + (built.empty() ? std::string("an unknown domain") : built) +
+                   ", but Server is set to " + m_settings.domain + ".";
+        }
+    }
+    return {};
+}
+
+bool App::buildNeedsClean() const
+{
+    return !buildDomainProblem().empty();
+}
+
 std::string App::buildBlocker() const
 {
     if (!repoValid()) return "Choose the patcher folder first.";
     if (makeScriptHasCRLF()) return "Fix the line endings of make.sh first (Requirements).";
     if (!m_requirements.ready()) return m_checking ? "Checking the requirements..." : "Fix the requirements first.";
     if (!domainValid()) return "Set the server domain first.";
+    if (buildNeedsClean() && !(m_settings.buildPayload && m_settings.buildStage1 && m_settings.buildPatch)) {
+        return "The domain changed: select payloads, stage 1 and Gecko codes for a complete rebuild.";
+    }
     if (!(m_settings.buildPayload || m_settings.buildStage1 || m_settings.buildPatch || m_settings.buildExploit)) {
         return "Choose something to build.";
     }
@@ -1376,6 +1426,9 @@ void App::drawBuild()
     KeyStatus keys = keyStatus();
     std::string command = buildCommand();
     std::string blocker = buildBlocker();
+    if (buildNeedsClean()) {
+        ImGui::TextColored(colorWarn, "The saved build uses another domain. Build will clean old output and rebuild for %s.", m_settings.domain.c_str());
+    }
     if (m_task) {
         if (ImGui::Button("Cancel")) {
             m_task->kill();
@@ -1456,6 +1509,10 @@ void App::drawInstall()
     statusLine(output.key && keys.distMatches, "Signing key", output.key ? (keys.distMatches ? "dist/private-key.pem" : "does not match misc/private-key-OUT.pem") : "",
                "dist/private-key.pem is missing or from another key: build again.");
     statusLine(output.sbcm > 0, "SBCM exploits", output.sbcm > 0 ? std::to_string(output.sbcm) + " in exploit/sbcm" : "optional", "Optional: only for patching Mario Kart Wii during matchmaking.");
+    const std::string domainProblem = buildDomainProblem();
+    const std::string domainHint = domainProblem.empty() ? "" : domainProblem + " Rebuild before installing.";
+    statusLine(domainProblem.empty(), "Build domain", domainProblem.empty() ? m_settings.domain : "",
+               domainHint.c_str());
 
     ImGui::SeparatorText("Destination");
     if (m_settings.serverDir.empty()) {
@@ -1475,7 +1532,7 @@ void App::drawInstall()
             ImGui::PopFont();
         }
         ImGui::Spacing();
-        if (primaryButton("Install into the server", output.stage1 && output.payloads > 0 && keys.distMatches)) {
+        if (primaryButton("Install into the server", domainValid() && output.stage1 && output.payloads > 0 && keys.distMatches && domainProblem.empty())) {
             m_installOk = install(m_installMessage);
         }
         ImGui::SameLine();
@@ -1504,6 +1561,7 @@ void App::drawInstall()
 void App::drawGecko()
 {
     heading("Gecko codes", "Choose the game and region that match your copy. In Dolphin, open the game's Properties > Gecko Codes > Add New Code, then paste the code below.");
+    ImGui::TextColored(colorWarn, "After a rebuild, replace the old Gecko code in Dolphin. Do not enable both versions.");
 
     if (m_geckoFiles.empty()) {
         ImGui::TextColored(colorWarn, "No Gecko codes yet: build with \"Gecko codes (stage 0)\" enabled.");
@@ -1568,7 +1626,8 @@ void App::drawGecko()
                 ImGui::PopTextWrapPos();
             }
         }
-        if (primaryButton("Copy Gecko code")) {
+        const bool codeMatchesServer = !builtDomain.empty() && asciiLower(builtDomain) == asciiLower(m_settings.domain);
+        if (primaryButton("Copy Gecko code", codeMatchesServer)) {
             ImGui::SetClipboardText(m_geckoContent.c_str());
             m_geckoCopiedAt = std::chrono::steady_clock::now();
         }
